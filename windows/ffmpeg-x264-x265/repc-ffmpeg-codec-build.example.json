@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "architecture": "arm64",
+  "ffmpegRevision": "dd00a614e16a15db0b230dfe45790e913e593695",
+  "x264Revision": "0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee",
+  "x265Revision": "b81f650e21e8aacbe6a9ad04ce14aefc05b932c0",
+  "configuration": "--enable-gpl --enable-shared --disable-static --enable-libx264 --enable-libx265",
+  "encoders": [
+    "libx264",
+    "libx265"
+  ],
+  "runtimeFiles": [
+    "repc-codec-avcodec-62.dll",
+    "repc-codec-avutil-60.dll",
+    "repc-codec-swscale-9.dll",
+    "x264-164.dll",
+    "libx265.dll"
+  ],
+  "toolchain": {
+    "environment": "MSYS2 CLANGARM64",
+    "compiler": "clang",
+    "compilerVersion": "<record exact version>",
+    "cmakeVersion": "<record exact version>",
+    "nasmVersion": "<record exact version or not-applicable>"
+  }
+}

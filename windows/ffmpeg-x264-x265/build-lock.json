@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "package": "repc-windows-ffmpeg-x264-x265",
+  "components": {
+    "ffmpeg": {
+      "repository": "https://git.ffmpeg.org/ffmpeg.git",
+      "revision": "dd00a614e16a15db0b230dfe45790e913e593695",
+      "licenseFile": "COPYING.GPLv2",
+      "expectedLibavcodecMajor": 62
+    },
+    "x264": {
+      "repository": "https://code.videolan.org/videolan/x264.git",
+      "revision": "0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee",
+      "licenseFile": "COPYING"
+    },
+    "x265": {
+      "repository": "https://bitbucket.org/multicoreware/x265_git.git",
+      "revision": "b81f650e21e8aacbe6a9ad04ce14aefc05b932c0",
+      "licenseFile": "COPYING"
+    }
+  },
+  "requiredFfmpegConfiguration": [
+    "--enable-gpl",
+    "--enable-shared",
+    "--enable-libx264",
+    "--enable-libx265"
+  ],
+  "requiredEncoders": [
+    "libx264",
+    "libx265"
+  ],
+  "requiredRuntimeFiles": [
+    "repc-codec-avcodec-62.dll",
+    "repc-codec-avutil-60.dll",
+    "repc-codec-swscale-9.dll",
+    "libx264-165.dll",
+    "libx265.dll"
+  ]
+}
