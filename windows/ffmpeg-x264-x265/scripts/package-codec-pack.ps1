@@ -245,7 +245,7 @@ try {
         x264Revision = [string]$codecBuild.x264Revision
         x265Revision = [string]$codecBuild.x265Revision
         configuration = $configuration
-        encoders = @($lock.requiredEncoders)
+        encoders = $encoders
         sourceBundle = Split-Path -Leaf $sourceArchive
         files = $files
     }

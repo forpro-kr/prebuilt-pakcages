@@ -106,11 +106,27 @@ else
 fi
 
 export PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+package_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+mf_patches=("$package_root/patches/0001-mf-low-delay.patch" "$package_root/patches/0002-mf-upstream-fixes.patch")
+mf_patch_hash=""
+mf_configuration=""
+encoder_json='"libx264", "libx265"'
+if [[ "$architecture" == "arm64" ]]; then
+  command -v patch >/dev/null || { echo "required MSYS2 tool is missing: patch"; exit 3; }
+  # Hash ordered patch contents, not checkout-specific absolute paths.
+  mf_patch_hash="$(sha256sum "${mf_patches[@]}" | cut -d' ' -f1 | sha256sum | cut -d' ' -f1)"
+  mf_configuration=" --enable-mediafoundation --enable-encoder=h264_mf,hevc_mf"
+  encoder_json+=', "h264_mf", "hevc_mf"'
+fi
 ffmpeg_namespace_ready() {
   local avcodec="$prefix/bin/repc-codec-avcodec-62.dll"
   local avutil="$prefix/bin/repc-codec-avutil-60.dll"
   local swscale="$prefix/bin/repc-codec-swscale-9.dll"
   [[ -f "$avcodec" && -f "$avutil" && -f "$swscale" ]] || return 1
+  if [[ "$architecture" == "arm64" ]]; then
+    [[ -f "$prefix/repc-mf-patch.sha256" ]] || return 1
+    [[ "$(<"$prefix/repc-mf-patch.sha256")" == "$mf_patch_hash" ]] || return 1
+  fi
   llvm-readobj --coff-imports "$avcodec" |
     grep -qi 'Name: repc-codec-avutil-60\.dll' || return 1
   llvm-readobj --coff-imports "$swscale" |
@@ -140,8 +156,24 @@ if ! ffmpeg_namespace_ready; then
     "$prefix"/lib/repc-codec-avutil-*.def \
     "$prefix"/lib/repc-codec-swscale-*.def
   mkdir -p "$ffmpeg_build"
+  ffmpeg_source="$source_root/ffmpeg"
+  ffmpeg_extra=()
+  if [[ "$architecture" == "arm64" ]]; then
+    # Export pinned source; never mutate the shared upstream checkout. This
+    # patch ships in the package source archive with the build instructions.
+    ffmpeg_source="$ffmpeg_build/source"
+    mkdir -p "$ffmpeg_source"
+    git -C "$source_root/ffmpeg" archive --format=tar HEAD | tar -xf - -C "$ffmpeg_source"
+    # git apply inside a parent repository can silently skip exported paths.
+    for mf_patch in "${mf_patches[@]}"; do
+      patch --batch --forward -d "$ffmpeg_source" -p1 -i "$mf_patch"
+    done
+    grep -q '"repc_low_delay_version".*i64 = 2' "$ffmpeg_source/libavcodec/mfenc.c"
+    grep -q 'IMFDXGIDeviceManager_Release(c->dxgiManager)' "$ffmpeg_source/libavcodec/mfenc.c"
+    ffmpeg_extra=(--enable-mediafoundation --enable-encoder=h264_mf,hevc_mf)
+  fi
   pushd "$ffmpeg_build" >/dev/null
-  "$source_root/ffmpeg/configure" \
+  "$ffmpeg_source/configure" \
     --prefix="$prefix" \
     --target-os=mingw32 \
     --arch="$ffmpeg_arch" \
@@ -174,12 +206,16 @@ if ! ffmpeg_namespace_ready; then
     --disable-doc \
     --disable-debug \
     --extra-cflags="-I$prefix/include" \
-    --extra-ldflags="-L$prefix/lib"
+    --extra-ldflags="-L$prefix/lib" \
+    "${ffmpeg_extra[@]}"
   sed -i \
     's|^SLIBNAME_WITH_MAJOR=.*|SLIBNAME_WITH_MAJOR=repc-codec-$(FULLNAME)-$(LIBMAJOR)$(SLIBSUF)|' \
     ffbuild/config.mak
   make -j"$parallel"
   make install
+  if [[ "$architecture" == "arm64" ]]; then
+    printf '%s\n' "$mf_patch_hash" > "$prefix/repc-mf-patch.sha256"
+  fi
   popd >/dev/null
 else
   echo "FFmpeg install already present; reusing $prefix"
@@ -241,8 +277,9 @@ cat >"$runtime/repc-ffmpeg-codec-build.json" <<EOF
   "ffmpegRevision": "$ffmpeg_revision",
   "x264Revision": "$x264_revision",
   "x265Revision": "$x265_revision",
-  "configuration": "--enable-gpl --enable-shared --disable-static --enable-libx264 --enable-libx265",
-  "encoders": ["libx264", "libx265"],
+  "configuration": "--enable-gpl --enable-shared --disable-static --enable-libx264 --enable-libx265$mf_configuration",
+  "encoders": [$encoder_json],
+  "mfLowDelayPatchSha256": "$mf_patch_hash",
   "runtimeFiles": [$runtime_json],
   "toolchain": {
     "environment": "${MSYSTEM:-unknown}",

@@ -1,0 +1,192 @@
+diff --git a/libavcodec/mfenc.c b/libavcodec/mfenc.c
+index 30531fe3..b77722b4 100644
+--- a/libavcodec/mfenc.c
++++ b/libavcodec/mfenc.c
+@@ -64,6 +64,8 @@ typedef struct MFContext {
+     int opt_enc_quality;
+     int opt_enc_scenario;
+     int opt_enc_hw;
++    int low_delay_pending;
++    int repc_low_delay_version;
+     AVD3D11VADeviceContext* device_hwctx;
+ } MFContext;
+ 
+@@ -74,13 +76,37 @@ static int mf_setup_context(AVCodecContext *avctx);
+ // Sentinel value only used by us.
+ #define MF_INVALID_TIME AV_NOPTS_VALUE
+ 
+-static int mf_wait_events(AVCodecContext *avctx)
++static int mf_wait_events(AVCodecContext *avctx, int want_output)
+ {
+     MFContext *c = avctx->priv_data;
+ 
+     if (!c->async_events)
+         return 0;
+ 
++    // Hardware MFTs may queue several NeedInput events ahead of HaveOutput.
++    // In low-delay mode collect all available events instead of returning on
++    // the first credit (which adds one frame of latency per queued event).
++    if (avctx->flags & AV_CODEC_FLAG_LOW_DELAY) {
++        if (want_output && !c->low_delay_pending && !c->draining)
++            return 0;
++        for (int events = 0; events < 128; ++events) {
++            IMFMediaEvent *ev = NULL;
++            MediaEventType ev_id = 0;
++            HRESULT hr = IMFMediaEventGenerator_GetEvent(c->async_events, MF_EVENT_FLAG_NO_WAIT, &ev);
++            if (hr == MF_E_NO_EVENTS_AVAILABLE) {
++                return 0;
++            }
++            if (FAILED(hr)) return AVERROR_EXTERNAL;
++            IMFMediaEvent_GetType(ev, &ev_id);
++            if (ev_id == ff_METransformNeedInput && !c->draining) ++c->async_need_input;
++            if (ev_id == ff_METransformHaveOutput) ++c->async_have_output;
++            if (ev_id == ff_METransformDrainComplete) c->draining_done = 1;
++            if (ev_id == ff_METransformMarker) c->async_marker = 1;
++            IMFMediaEvent_Release(ev);
++        }
++        return AVERROR_EXTERNAL;
++    }
++
+     while (!(c->async_need_input || c->async_have_output || c->draining_done || c->async_marker)) {
+         IMFMediaEvent *ev = NULL;
+         MediaEventType ev_id = 0;
+@@ -505,7 +531,7 @@ static int mf_send_sample(AVCodecContext *avctx, IMFSample *sample)
+ 
+     if (sample) {
+         if (c->async_events) {
+-            if ((ret = mf_wait_events(avctx)) < 0)
++            if ((ret = mf_wait_events(avctx, 0)) < 0)
+                 return ret;
+             if (!c->async_need_input)
+                 return AVERROR(EAGAIN);
+@@ -520,7 +546,11 @@ static int mf_send_sample(AVCodecContext *avctx, IMFSample *sample)
+             av_log(avctx, AV_LOG_ERROR, "failed processing input: %s\n", ff_hr_str(hr));
+             return AVERROR_EXTERNAL;
+         }
+-        c->async_need_input = 0;
++        if (avctx->flags & AV_CODEC_FLAG_LOW_DELAY) ++c->low_delay_pending;
++        if ((avctx->flags & AV_CODEC_FLAG_LOW_DELAY) && c->async_need_input > 0)
++            --c->async_need_input;
++        else
++            c->async_need_input = 0;
+     } else if (!c->draining) {
+         hr = IMFTransform_ProcessMessage(c->mft, MFT_MESSAGE_COMMAND_DRAIN, 0);
+         if (FAILED(hr))
+@@ -549,7 +579,7 @@ static int mf_receive_sample(AVCodecContext *avctx, IMFSample **out_sample)
+         sample = NULL;
+ 
+         if (c->async_events) {
+-            if ((ret = mf_wait_events(avctx)) < 0)
++            if ((ret = mf_wait_events(avctx, 1)) < 0)
+                 return ret;
+             if (!c->async_have_output || c->draining_done) {
+                 ret = 0;
+@@ -577,6 +607,8 @@ static int mf_receive_sample(AVCodecContext *avctx, IMFSample **out_sample)
+             IMFCollection_Release(out_buffers.pEvents);
+ 
+         if (!FAILED(hr)) {
++            if ((avctx->flags & AV_CODEC_FLAG_LOW_DELAY) && c->low_delay_pending > 0)
++                --c->low_delay_pending;
+             *out_sample = out_buffers.pSample;
+             ret = 0;
+             break;
+@@ -609,7 +641,10 @@ static int mf_receive_sample(AVCodecContext *avctx, IMFSample **out_sample)
+         break;
+     }
+ 
+-    c->async_have_output = 0;
++    if ((avctx->flags & AV_CODEC_FLAG_LOW_DELAY) && c->async_have_output > 0)
++        --c->async_have_output;
++    else
++        c->async_have_output = 0;
+ 
+     if (ret >= 0 && !*out_sample)
+         ret = c->draining_done ? AVERROR_EOF : AVERROR(EAGAIN);
+@@ -625,6 +660,8 @@ static int mf_receive_packet(AVCodecContext *avctx, AVPacket *avpkt)
+ 
+     if (!c->frame->buf[0]) {
+         ret = ff_encode_get_frame(avctx, c->frame);
++        if (ret == AVERROR(EAGAIN) && (avctx->flags & AV_CODEC_FLAG_LOW_DELAY))
++            goto receive_available;
+         if (ret < 0 && ret != AVERROR_EOF)
+             return ret;
+     }
+@@ -643,6 +680,23 @@ static int mf_receive_packet(AVCodecContext *avctx, AVPacket *avpkt)
+ 
+     if(!c->stream_started)
+     {
++        if (c->codec_api && (avctx->flags & AV_CODEC_FLAG_LOW_DELAY)) {
++            // Reapply after media-type/device negotiation: some hardware MFTs
++            // reset codec properties when SetInputType or the device changes.
++            HRESULT low_hr = ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVLowLatencyMode, FF_VAL_VT_BOOL(VARIANT_TRUE));
++            HRESULT b_hr = ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncMPVDefaultBPictureCount, FF_VAL_VT_UI4(0));
++            if (FAILED(low_hr) || FAILED(b_hr)) {
++                av_log(avctx, AV_LOG_ERROR, "MF low-delay policy rejected: low_latency=%s B=0:%s\n", ff_hr_str(low_hr), ff_hr_str(b_hr));
++                if (sample) IMFSample_Release(sample);
++                return AVERROR(ENOSYS);
++            }
++            if (avctx->compression_level >= 0)
++                ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncCommonQualityVsSpeed, FF_VAL_VT_UI4(avctx->compression_level));
++            // Buffer units vary by codec. Only H.264 documents this in bytes.
++            if (avctx->codec_id == AV_CODEC_ID_H264 && avctx->rc_buffer_size > 0)
++                ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncCommonBufferSize, FF_VAL_VT_UI4(avctx->rc_buffer_size));
++            av_log(avctx, AV_LOG_INFO, "MF hardware low-delay active: B=0, asynchronous nonblocking output\n");
++        }
+         HRESULT hr = IMFTransform_ProcessMessage(c->mft, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+         if (FAILED(hr)) {
+             av_log(avctx, AV_LOG_ERROR, "could not start streaming (%s)\n", ff_hr_str(hr));
+@@ -666,6 +720,7 @@ static int mf_receive_packet(AVCodecContext *avctx, AVPacket *avpkt)
+     if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
+         return ret;
+ 
++receive_available:
+     ret = mf_receive_sample(avctx, &sample);
+     if (ret < 0)
+         return ret;
+@@ -866,6 +921,12 @@ static int mf_encv_output_adjust(AVCodecContext *avctx, IMFMediaType *type)
+ 
+         if (c->opt_enc_scenario >= 0)
+             ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVScenarioInfo, FF_VAL_VT_UI4(c->opt_enc_scenario));
++        if (avctx->flags & AV_CODEC_FLAG_LOW_DELAY) {
++            HRESULT hr = ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVLowLatencyMode, FF_VAL_VT_BOOL(VARIANT_TRUE));
++            av_log(avctx, SUCCEEDED(hr) ? AV_LOG_INFO : AV_LOG_WARNING,
++                   "RePC MF CODECAPI_AVLowLatencyMode=1: %s\n", ff_hr_str(hr));
++            ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncMPVDefaultBPictureCount, FF_VAL_VT_UI4(0));
++        }
+     }
+ 
+     return 0;
+@@ -904,6 +965,12 @@ static int mf_encv_input_adjust(AVCodecContext *avctx, IMFMediaType *type)
+     }
+ 
+     //ff_MFSetAttributeSize((IMFAttributes *)type, &MF_MT_FRAME_SIZE, avctx->width, avctx->height);
++    if (avctx->pix_fmt == AV_PIX_FMT_D3D11 && (avctx->flags & AV_CODEC_FLAG_LOW_DELAY)) {
++        ff_MFSetAttributeSize((IMFAttributes *)type, &MF_MT_FRAME_SIZE, avctx->width, avctx->height);
++        ff_MFSetAttributeRatio((IMFAttributes *)type, &MF_MT_FRAME_RATE, avctx->framerate.num, avctx->framerate.den);
++        ff_MFSetAttributeRatio((IMFAttributes *)type, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
++        IMFAttributes_SetUINT32(type, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
++    }
+ 
+     return 0;
+ }
+@@ -1176,6 +1243,12 @@ static int mf_unlock_async(AVCodecContext *avctx)
+         goto err;
+     }
+ 
++    if (avctx->flags & AV_CODEC_FLAG_LOW_DELAY) {
++        hr = IMFAttributes_SetUINT32(attrs, &MF_LOW_LATENCY, TRUE);
++        av_log(avctx, SUCCEEDED(hr) ? AV_LOG_INFO : AV_LOG_WARNING,
++               "RePC MF MF_LOW_LATENCY=1: %s\n", ff_hr_str(hr));
++    }
++
+     hr = IMFTransform_QueryInterface(c->mft, &IID_IMFMediaEventGenerator, (void **)&c->async_events);
+     if (FAILED(hr)) {
+         av_log(avctx, AV_LOG_ERROR, "could not get async interface\n");
+@@ -1423,6 +1496,7 @@ MF_ENCODER(AUDIO, mp3,         MP3, NULL, AFMTS, ACAPS, NULL);
+ 
+ #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+ static const AVOption venc_opts[] = {
++    {"repc_low_delay_version", "RePC nonblocking MF low-delay patch ABI", OFFSET(repc_low_delay_version), AV_OPT_TYPE_INT, {.i64 = 1}, 1, 1, VE},
+     {"rate_control",  "Select rate control mode", OFFSET(opt_enc_rc), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, VE, .unit = "rate_control"},
+     { "default",      "Default mode", 0, AV_OPT_TYPE_CONST, {.i64 = -1}, 0, 0, VE, .unit = "rate_control"},
+     { "cbr",          "CBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_CBR}, 0, 0, VE, .unit = "rate_control"},

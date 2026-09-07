@@ -1,0 +1,73 @@
+diff --git a/libavcodec/mfenc.c b/libavcodec/mfenc.c
+index b77722b4..11e59538 100644
+--- a/libavcodec/mfenc.c
++++ b/libavcodec/mfenc.c
+@@ -683,6 +683,16 @@ static int mf_receive_packet(AVCodecContext *avctx, AVPacket *avpkt)
+         if (c->codec_api && (avctx->flags & AV_CODEC_FLAG_LOW_DELAY)) {
+             // Reapply after media-type/device negotiation: some hardware MFTs
+             // reset codec properties when SetInputType or the device changes.
++            // Scenario must precede low latency/B=0: setting a scenario may
++            // itself change those properties (Qualcomm CameraRecord).
++            if (c->opt_enc_scenario >= 0) {
++                HRESULT scenario_hr = ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVScenarioInfo, FF_VAL_VT_UI4(c->opt_enc_scenario));
++                if (FAILED(scenario_hr)) {
++                    av_log(avctx, AV_LOG_ERROR, "MF low-delay scenario rejected: %s\n", ff_hr_str(scenario_hr));
++                    if (sample) IMFSample_Release(sample);
++                    return AVERROR(ENOSYS);
++                }
++            }
+             HRESULT low_hr = ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVLowLatencyMode, FF_VAL_VT_BOOL(VARIANT_TRUE));
+             HRESULT b_hr = ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncMPVDefaultBPictureCount, FF_VAL_VT_UI4(0));
+             if (FAILED(low_hr) || FAILED(b_hr)) {
+@@ -952,6 +962,7 @@ static int64_t mf_encv_input_score(AVCodecContext *avctx, IMFMediaType *type)
+ static int mf_encv_input_adjust(AVCodecContext *avctx, IMFMediaType *type)
+ {
+     enum AVPixelFormat pix_fmt = ff_media_type_to_pix_fmt((IMFAttributes *)type);
++    AVRational framerate;
+     if (avctx->pix_fmt == AV_PIX_FMT_D3D11) {
+         if (pix_fmt != AV_PIX_FMT_NV12 && pix_fmt != AV_PIX_FMT_D3D11) {
+             av_log(avctx, AV_LOG_ERROR, "unsupported input pixel format set\n");
+@@ -964,13 +975,16 @@ static int mf_encv_input_adjust(AVCodecContext *avctx, IMFMediaType *type)
+         }
+     }
+ 
+-    //ff_MFSetAttributeSize((IMFAttributes *)type, &MF_MT_FRAME_SIZE, avctx->width, avctx->height);
+-    if (avctx->pix_fmt == AV_PIX_FMT_D3D11 && (avctx->flags & AV_CODEC_FLAG_LOW_DELAY)) {
+-        ff_MFSetAttributeSize((IMFAttributes *)type, &MF_MT_FRAME_SIZE, avctx->width, avctx->height);
+-        ff_MFSetAttributeRatio((IMFAttributes *)type, &MF_MT_FRAME_RATE, avctx->framerate.num, avctx->framerate.den);
+-        ff_MFSetAttributeRatio((IMFAttributes *)type, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+-        IMFAttributes_SetUINT32(type, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
++    // FFmpeg 9acd820732f0: populate the input type for strict hardware MFTs.
++    ff_MFSetAttributeSize((IMFAttributes *)type, &MF_MT_FRAME_SIZE, avctx->width, avctx->height);
++    IMFAttributes_SetUINT32(type, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
++    if (avctx->framerate.num > 0 && avctx->framerate.den > 0) {
++        framerate = avctx->framerate;
++    } else {
++        framerate = av_inv_q(avctx->time_base);
+     }
++    ff_MFSetAttributeRatio((IMFAttributes *)type, &MF_MT_FRAME_RATE, framerate.num, framerate.den);
++    ff_MFSetAttributeRatio((IMFAttributes *)type, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+ 
+     return 0;
+ }
+@@ -1429,6 +1443,11 @@ static int mf_close(AVCodecContext *avctx)
+     if (c->async_events)
+         IMFMediaEventGenerator_Release(c->async_events);
+ 
++    // FFmpeg b2910ec92ef0: release our manager reference on every close,
++    // including failed initialization; the transform owns its own reference.
++    if (c->dxgiManager)
++        IMFDXGIDeviceManager_Release(c->dxgiManager);
++
+ #if !HAVE_UWP
+     if (c->library)
+         ff_free_mf(&c->functions, &c->mft);
+@@ -1496,7 +1515,7 @@ MF_ENCODER(AUDIO, mp3,         MP3, NULL, AFMTS, ACAPS, NULL);
+ 
+ #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+ static const AVOption venc_opts[] = {
+-    {"repc_low_delay_version", "RePC nonblocking MF low-delay patch ABI", OFFSET(repc_low_delay_version), AV_OPT_TYPE_INT, {.i64 = 1}, 1, 1, VE},
++    {"repc_low_delay_version", "RePC nonblocking MF low-delay patch ABI", OFFSET(repc_low_delay_version), AV_OPT_TYPE_INT, {.i64 = 2}, 2, 2, VE},
+     {"rate_control",  "Select rate control mode", OFFSET(opt_enc_rc), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, VE, .unit = "rate_control"},
+     { "default",      "Default mode", 0, AV_OPT_TYPE_CONST, {.i64 = -1}, 0, 0, VE, .unit = "rate_control"},
+     { "cbr",          "CBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_CBR}, 0, 0, VE, .unit = "rate_control"},

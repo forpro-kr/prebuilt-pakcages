@@ -3,6 +3,18 @@
 Windows 하드웨어 인코더를 사용할 수 없을 때 RePC가 선택적으로 설치하는
 GPL FFmpeg software codec pack이다.
 
+ARM64 팩은 추가로 `h264_mf`/`hevc_mf` 하드웨어 인코더를 포함한다. x64
+구성은 바꾸지 않는다. `patches/0001-mf-low-delay.patch`는 pinned FFmpeg의
+LOW_DELAY를 MF 저지연 속성/B=0에 연결하고 비동기 이벤트 크레딧과 출력
+polling을 수정한다. 다음 `0002-mf-upstream-fixes.patch`는 upstream의
+입력 타입 속성 및 DXGI manager 해제 수정을 backport하고 scenario를 저지연/B=0
+이전에 재적용한다. `repc_low_delay_version=2`로 앱이 계약을 확인한다.
+순서대로 결합한 패치 SHA-256(`mfLowDelayPatchSha256`)이 바뀌면 ARM64 FFmpeg를
+다시 빌드한다. 원본 checkout은 변경하지 않으며 export에 패치한다.
+두 패치는 대응 소스 ZIP에도 포함된다. 출처와 적용 순서는 [patches/README.md](patches/README.md)를 따른다.
+MF 표면은 D3D11 NV12이며 CPU readback은 요구하지 않지만 드라이버 내부
+복사 제거 또는 일정한 인코딩 지연은 보장하지 않는다.
+
 ## 고정 upstream
 
 [`build-lock.json`](build-lock.json)이 다음 공식 upstream과 revision을 고정한다.
