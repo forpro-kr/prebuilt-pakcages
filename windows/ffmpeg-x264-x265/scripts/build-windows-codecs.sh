@@ -28,7 +28,19 @@ case "$architecture" in
     ;;
 esac
 
-for tool in clang clang++ cmake ninja make pkg-config git python tar llvm-readobj; do
+cc=clang; cxx=clang++; ar=llvm-ar; ranlib=llvm-ranlib; strip=llvm-strip
+extra_tools=(llvm-readobj)
+ffmpeg_link_extra=()
+x265_link_flags="-static-libstdc++"
+ffmpeg_link_flags=""
+if [[ "$architecture" == "x64" ]]; then
+  cc=gcc; cxx=g++; ar=ar; ranlib=ranlib; strip=strip
+  extra_tools=(objdump nasm)
+  ffmpeg_link_extra=("--extra-libs=-Wl,-Bstatic -lstdc++ -lwinpthread -Wl,-Bdynamic")
+  x265_link_flags="-static-libstdc++ -static-libgcc"
+  ffmpeg_link_flags="-static-libgcc -static-libstdc++"
+fi
+for tool in "$cc" "$cxx" cmake ninja make pkg-config git python tar "${extra_tools[@]}"; do
   command -v "$tool" >/dev/null || {
     echo "required MSYS2 tool is missing: $tool"
     exit 3
@@ -62,10 +74,10 @@ if [[ ! -f "$prefix/lib/pkgconfig/x264.pc" ||
       -z "$(find "$prefix/bin" -maxdepth 1 -name '*x264*.dll' -print -quit)" ]]; then
   mkdir -p "$x264_build"
   pushd "$x264_build" >/dev/null
-  CC=clang \
-  AR=llvm-ar \
-  RANLIB=llvm-ranlib \
-  STRIP=llvm-strip \
+  CC="$cc" \
+  AR="$ar" \
+  RANLIB="$ranlib" \
+  STRIP="$strip" \
   PKGCONFIG=pkg-config \
   "$source_root/x264/configure" \
     --host="$x264_host" \
@@ -92,9 +104,9 @@ if [[ ! -f "$prefix/lib/pkgconfig/x265.pc" ||
   cmake -S "$x265_source_export/source" -B "$build_root/x265" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$prefix" \
-    -DCMAKE_C_COMPILER=clang \
-    -DCMAKE_CXX_COMPILER=clang++ \
-    -DCMAKE_SHARED_LINKER_FLAGS=-static-libstdc++ \
+    -DCMAKE_C_COMPILER="$cc" \
+    -DCMAKE_CXX_COMPILER="$cxx" \
+    "-DCMAKE_SHARED_LINKER_FLAGS=$x265_link_flags" \
     -DENABLE_SHARED=ON \
     -DENABLE_CLI=OFF \
     -DENABLE_ASSEMBLY=ON \
@@ -106,11 +118,28 @@ else
 fi
 
 export PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+if [[ "$architecture" == "x64" ]]; then
+  # Compile the dispatcher statically; GPU drivers remain supplied by vendors.
+  make -C "$source_root/nvcodec" PREFIX="$prefix" install
+  mkdir -p "$prefix/include/AMF"
+  cp -R "$source_root/amf/amf/public/include/"* "$prefix/include/AMF/"
+  cmake -S "$source_root/vpl" -B "$build_root/vpl" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+    -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx" \
+    -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTS=OFF -DBUILD_TOOLS=OFF -DINSTALL_EXAMPLE_CODE=OFF
+  cmake --build "$build_root/vpl" --parallel "$parallel"
+  cmake --install "$build_root/vpl"
+fi
 package_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 mf_patches=("$package_root/patches/0001-mf-low-delay.patch" "$package_root/patches/0002-mf-upstream-fixes.patch")
 mf_patch_hash=""
 mf_configuration=""
 encoder_json='"libx264", "libx265"'
+vendor_configuration=""
+if [[ "$architecture" == "x64" ]]; then
+  vendor_configuration=" --enable-ffnvcodec --enable-nvenc --enable-amf --enable-libvpl --enable-encoder=h264_nvenc,hevc_nvenc,h264_qsv,hevc_qsv,h264_amf,hevc_amf"
+  encoder_json+=', "h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"'
+fi
 if [[ "$architecture" == "arm64" ]]; then
   command -v patch >/dev/null || { echo "required MSYS2 tool is missing: patch"; exit 3; }
   # Hash ordered patch contents, not checkout-specific absolute paths.
@@ -123,14 +152,21 @@ ffmpeg_namespace_ready() {
   local avutil="$prefix/bin/repc-codec-avutil-60.dll"
   local swscale="$prefix/bin/repc-codec-swscale-9.dll"
   [[ -f "$avcodec" && -f "$avutil" && -f "$swscale" ]] || return 1
+  if [[ "$architecture" == "x64" ]]; then
+    [[ -f "$prefix/repc-vendor-configuration.txt" ]] || return 1
+    [[ "$(<"$prefix/repc-vendor-configuration.txt")" == "$vendor_configuration" ]] || return 1
+  fi
   if [[ "$architecture" == "arm64" ]]; then
     [[ -f "$prefix/repc-mf-patch.sha256" ]] || return 1
     [[ "$(<"$prefix/repc-mf-patch.sha256")" == "$mf_patch_hash" ]] || return 1
   fi
-  llvm-readobj --coff-imports "$avcodec" |
-    grep -qi 'Name: repc-codec-avutil-60\.dll' || return 1
-  llvm-readobj --coff-imports "$swscale" |
-    grep -qi 'Name: repc-codec-avutil-60\.dll' || return 1
+  if [[ "$architecture" == "arm64" ]]; then
+    llvm-readobj --coff-imports "$avcodec" | grep -qi 'Name: repc-codec-avutil-60\.dll' || return 1
+    llvm-readobj --coff-imports "$swscale" | grep -qi 'Name: repc-codec-avutil-60\.dll' || return 1
+  else
+    objdump -p "$avcodec" | grep -qi 'DLL Name: repc-codec-avutil-60\.dll' || return 1
+    objdump -p "$swscale" | grep -qi 'DLL Name: repc-codec-avutil-60\.dll' || return 1
+  fi
 }
 
 if ! ffmpeg_namespace_ready; then
@@ -158,6 +194,9 @@ if ! ffmpeg_namespace_ready; then
   mkdir -p "$ffmpeg_build"
   ffmpeg_source="$source_root/ffmpeg"
   ffmpeg_extra=()
+  if [[ "$architecture" == "x64" ]]; then
+    ffmpeg_extra=(--enable-ffnvcodec --enable-nvenc --enable-amf --enable-libvpl --enable-encoder=h264_nvenc,hevc_nvenc,h264_qsv,hevc_qsv,h264_amf,hevc_amf)
+  fi
   if [[ "$architecture" == "arm64" ]]; then
     # Export pinned source; never mutate the shared upstream checkout. This
     # patch ships in the package source archive with the build instructions.
@@ -177,8 +216,8 @@ if ! ffmpeg_namespace_ready; then
     --prefix="$prefix" \
     --target-os=mingw32 \
     --arch="$ffmpeg_arch" \
-    --cc=clang \
-    --cxx=clang++ \
+    --cc="$cc" \
+    --cxx="$cxx" \
     --enable-gpl \
     --enable-shared \
     --disable-static \
@@ -206,13 +245,17 @@ if ! ffmpeg_namespace_ready; then
     --disable-doc \
     --disable-debug \
     --extra-cflags="-I$prefix/include" \
-    --extra-ldflags="-L$prefix/lib" \
+    --extra-ldflags="-L$prefix/lib $ffmpeg_link_flags" \
+    "${ffmpeg_link_extra[@]}" \
     "${ffmpeg_extra[@]}"
   sed -i \
     's|^SLIBNAME_WITH_MAJOR=.*|SLIBNAME_WITH_MAJOR=repc-codec-$(FULLNAME)-$(LIBMAJOR)$(SLIBSUF)|' \
     ffbuild/config.mak
   make -j"$parallel"
   make install
+  if [[ "$architecture" == "x64" ]]; then
+    printf '%s\n' "$vendor_configuration" > "$prefix/repc-vendor-configuration.txt"
+  fi
   if [[ "$architecture" == "arm64" ]]; then
     printf '%s\n' "$mf_patch_hash" > "$prefix/repc-mf-patch.sha256"
   fi
@@ -247,6 +290,10 @@ for required_path in "${runtime_inputs[@]}"; do
   }
 done
 cp -f -- "${runtime_inputs[@]}" "$runtime/"
+# The UCRT/GCC threading runtime may be required by the codec libraries.
+if [[ "$architecture" == "x64" ]] && objdump -p "$runtime/"*.dll | grep -qi 'DLL Name: libwinpthread-1.dll'; then
+  cp -- /ucrt64/bin/libwinpthread-1.dll "$runtime/"
+fi
 
 x264_revision="$(git -C "$source_root/x264" rev-parse HEAD)"
 x265_revision="$(git -C "$source_root/x265" rev-parse HEAD)"
@@ -268,7 +315,7 @@ for dll_path in "$runtime"/*.dll; do
   runtime_json+="\"$dll_name\""
 done
 
-clang_version="$(clang --version | head -n 1 | sed 's/"/\\"/g')"
+clang_version="$("$cc" --version | head -n 1 | sed 's/"/\\"/g')"
 cmake_version="$(cmake --version | head -n 1 | sed 's/"/\\"/g')"
 cat >"$runtime/repc-ffmpeg-codec-build.json" <<EOF
 {
@@ -277,7 +324,10 @@ cat >"$runtime/repc-ffmpeg-codec-build.json" <<EOF
   "ffmpegRevision": "$ffmpeg_revision",
   "x264Revision": "$x264_revision",
   "x265Revision": "$x265_revision",
-  "configuration": "--enable-gpl --enable-shared --disable-static --enable-libx264 --enable-libx265$mf_configuration",
+  "nvcodecRevision": "$(git -C "$source_root/nvcodec" rev-parse HEAD)",
+  "amfRevision": "$(git -C "$source_root/amf" rev-parse HEAD)",
+  "vplRevision": "$(git -C "$source_root/vpl" rev-parse HEAD)",
+  "configuration": "--enable-gpl --enable-shared --disable-static --enable-libx264 --enable-libx265$mf_configuration$vendor_configuration",
   "encoders": [$encoder_json],
   "mfLowDelayPatchSha256": "$mf_patch_hash",
   "runtimeFiles": [$runtime_json],

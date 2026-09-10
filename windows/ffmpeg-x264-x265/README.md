@@ -1,5 +1,14 @@
 # RePC Windows FFmpeg x264/x265 codec pack
 
+## 2026-09-10 Windows x64 확장
+
+- x64 UCRT/GCC 팩에 FFmpeg NVENC/QSV/AMF(H.264/HEVC)를 추가했다. x264/x265는 마지막 소프트웨어 폴백이다. NVIDIA/AMD/Intel 드라이버 자체는 포함하지 않는다.
+- nv-codec-headers, AMF, oneVPL 소스도 build-lock으로 고정한다. oneVPL dispatcher는 정적으로 빌드한다.
+- 새 NSIS는 사용자별이 아닌 관리자 설치다: `%ProgramW6432%\ForPro\RePC\codecs\ffmpeg\<arch>\<version>`. HKLM 64-bit view의 활성 경로를 통해 SYSTEM 서비스와 사용자 앱이 같은 팩을 찾는다. 기존 버전은 자동 삭제하지 않는다.
+- `/S`로 silent 설치가 가능하며 서비스 재시작은 하지 않는다. 메인 설치기의 다운로드 체크박스는 아직 연동하지 않았다.
+- `package-codec-pack.ps1 -Sign -SignToolPath <signtool.exe>`로 선택적 서명/검증 후 SHA256SUMS를 생성한다. 서명하지 않은 로컬 산출물은 공개 배포 승인으로 간주하지 않는다.
+- 아래 LocalAppData/ARM64 위주 내용은 이전 버전 이력이다. x64 실기기 인코딩과 NSIS acceptance는 별도로 기록한다.
+
 Windows 하드웨어 인코더를 사용할 수 없을 때 RePC가 선택적으로 설치하는
 GPL FFmpeg software codec pack이다.
 

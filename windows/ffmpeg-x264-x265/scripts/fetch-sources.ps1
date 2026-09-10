@@ -20,7 +20,7 @@ $sourceRoot = if ([string]::IsNullOrWhiteSpace($OutputDir)) {
 
 New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
 
-foreach ($name in @("ffmpeg", "x264", "x265")) {
+foreach ($name in @($lock.components.PSObject.Properties.Name)) {
     $component = $lock.components.$name
     $destination = Join-Path $sourceRoot $name
     if (-not (Test-Path -LiteralPath (Join-Path $destination ".git"))) {

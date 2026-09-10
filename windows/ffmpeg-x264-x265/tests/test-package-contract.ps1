@@ -48,15 +48,26 @@ Assert-Contains $buildScript "--enable-libx265"
 Assert-Contains $buildScript "repc-codec-avcodec-62.dll"
 Assert-Contains $buildScript "SLIBNAME_WITH_MAJOR=repc-codec-"
 Assert-Contains $buildScript "ffmpeg_namespace_ready"
-Assert-Contains $buildScript "llvm-readobj --coff-imports"
+Assert-Contains $buildScript 'objdump -p'
 Assert-Contains $buildScript "-static-libstdc++"
 foreach ($runtimeName in @("libx264-165.dll", "libx265.dll")) {
     if ($runtimeName -notin @($lock.requiredRuntimeFiles)) {
         throw "Missing locked codec runtime: $runtimeName"
     }
 }
-Assert-Contains $nsis "RequestExecutionLevel user"
-Assert-Contains $nsis '$LOCALAPPDATA\ForPro\RePC\codecs\ffmpeg\${REPC_ARCH}'
+Assert-Contains $nsis "RequestExecutionLevel admin"
+Assert-Contains $nsis '$PROGRAMFILES64\ForPro\RePC\codecs\ffmpeg\${REPC_ARCH}\${REPC_VERSION}'
+Assert-Contains $nsis 'SetRegView 64'
+Assert-Contains $nsis 'QuietUninstallString'
+Assert-Contains $nsis 'SetOverwrite off'
+Assert-Contains $nsis 'IfErrors failed'
+Assert-Contains $nsis '${IsNativeAMD64}'
+Assert-Contains $nsis '${IsNativeARM64}'
+Assert-Contains $packageScript 'CertificateThumbprint'
+foreach ($encoder in @('h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'hevc_qsv', 'h264_amf', 'hevc_amf')) {
+    Assert-Contains $buildScript $encoder
+    Assert-Contains $packageScript $encoder
+}
 Assert-Contains $nsis "WriteUninstaller"
 Assert-Contains $boundary "GPL runtime"
 

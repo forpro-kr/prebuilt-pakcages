@@ -12,7 +12,12 @@ param(
     [string]$OutputDir = "",
     [string]$NsisCompilerPath = "",
     [switch]$RequireNsis,
-    [switch]$PlanOnly
+    [switch]$PlanOnly,
+    [switch]$Sign,
+    [string]$CertificateThumbprint = $(if ($env:REPC_SIGN_THUMBPRINT) { $env:REPC_SIGN_THUMBPRINT } else { "A90AD3756DF6A5585DE261DB74D94EBE3823A6E1" }),
+    [string]$SignToolPath = "",
+    [string]$TimestampUrl = "http://timestamp.digicert.com",
+    [string]$SourceDownloadBaseUrl = "https://forpro.remote-pc.co.kr/updates/remote/codecs/"
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,6 +84,7 @@ $packageRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $packageRoot "..\..")).Path
 $lockPath = Join-Path $packageRoot "build-lock.json"
 $lock = Get-Content -LiteralPath $lockPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($Version -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}$') { throw 'Version must be X.Y.Z' }
 $resolvedRuntimeDir = Resolve-FullPath $repoRoot $RuntimeDir
 $resolvedBuildManifest = Resolve-FullPath $repoRoot $BuildManifestPath
 $resolvedSourceRoot = if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
@@ -102,8 +108,8 @@ $plan = [ordered]@{
     requiredConfiguration = @($lock.requiredFfmpegConfiguration)
     requiredEncoders = @($lock.requiredEncoders)
     requiredRuntimeFiles = @($lock.requiredRuntimeFiles)
-    installRoot = "%LOCALAPPDATA%\ForPro\RePC\codecs\ffmpeg\$Architecture"
-    nsis = "per-user installer"
+    installRoot = "%ProgramW6432%\ForPro\RePC\codecs\ffmpeg\$Architecture\$Version"
+    nsis = "machine-wide versioned installer; /S supported"
 }
 if ($PlanOnly) {
     $plan | ConvertTo-Json -Depth 5
@@ -118,7 +124,7 @@ $codecBuild = Get-Content -LiteralPath $resolvedBuildManifest -Raw -Encoding UTF
 if ([string]$codecBuild.architecture -ne $Architecture) {
     throw "Build architecture '$($codecBuild.architecture)' does not match '$Architecture'"
 }
-foreach ($componentName in @("ffmpeg", "x264", "x265")) {
+foreach ($componentName in @($lock.components.PSObject.Properties.Name)) {
     $manifestProperty = "${componentName}Revision"
     $actualRevision = [string]$codecBuild.$manifestProperty
     $expectedRevision = [string]$lock.components.$componentName.revision
@@ -133,6 +139,11 @@ foreach ($flag in @($lock.requiredFfmpegConfiguration)) {
     }
 }
 $encoders = @($codecBuild.encoders | ForEach-Object { [string]$_ })
+if ($Architecture -eq 'x64') {
+    foreach ($encoder in @('h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'hevc_qsv', 'h264_amf', 'hevc_amf')) {
+        if ($encoder -notin $encoders) { throw "Missing hardware encoder: $encoder" }
+    }
+}
 foreach ($encoder in @($lock.requiredEncoders)) {
     if ([string]$encoder -notin $encoders) {
         throw "Build manifest is missing required encoder: $encoder"
@@ -165,7 +176,7 @@ foreach ($runtimeName in $runtimeNames) {
 }
 
 $licenseInputs = [ordered]@{}
-foreach ($componentName in @("ffmpeg", "x264", "x265")) {
+foreach ($componentName in @($lock.components.PSObject.Properties.Name)) {
     $component = $lock.components.$componentName
     $componentRoot = Join-Path $resolvedSourceRoot $componentName
     $actualSourceRevision = (& git -C $componentRoot rev-parse HEAD 2>$null).Trim()
@@ -202,6 +213,14 @@ try {
         -Destination (Join-Path $licensesDir "x264-COPYING.txt") -Force
     Copy-Item -LiteralPath $licenseInputs.x265 `
         -Destination (Join-Path $licensesDir "x265-COPYING.txt") -Force
+    foreach ($componentName in @('nvcodec', 'amf', 'vpl')) {
+        Copy-Item -LiteralPath $licenseInputs[$componentName] -Destination (Join-Path $licensesDir "$componentName-LICENSE.txt")
+    }
+    if ('libwinpthread-1.dll' -in $runtimeNames) {
+        $pthreadLicense = 'C:\msys64\ucrt64\share\licenses\winpthreads\COPYING'
+        if (-not (Test-Path -LiteralPath $pthreadLicense)) { throw 'Missing winpthreads redistribution license' }
+        Copy-Item -LiteralPath $pthreadLicense -Destination (Join-Path $licensesDir 'winpthreads-COPYING.txt')
+    }
     Copy-Item -LiteralPath (Join-Path $packageRoot "THIRD_PARTY_NOTICES.md") `
         -Destination (Join-Path $stageDir "THIRD_PARTY_NOTICES.md") -Force
 
@@ -212,17 +231,17 @@ try {
     if (Test-Path -LiteralPath $sourceArchive) {
         Remove-Item -LiteralPath $sourceArchive -Force
     }
-    $sourceItems = @(
-        (Join-Path $resolvedSourceRoot "ffmpeg"),
-        (Join-Path $resolvedSourceRoot "x264"),
-        (Join-Path $resolvedSourceRoot "x265"),
-        $packageRoot
-    )
+    $sourceItems = @($lock.components.PSObject.Properties.Name | ForEach-Object { Join-Path $resolvedSourceRoot $_ }) + @($packageRoot)
     Compress-Archive -LiteralPath $sourceItems -DestinationPath $sourceArchive `
         -CompressionLevel Optimal
-    Copy-Item -LiteralPath $sourceArchive -Destination (
-        Join-Path $sourcesDir (Split-Path -Leaf $sourceArchive)
-    ) -Force
+    # Publish the exact corresponding-source ZIP next to the installer. Do not
+    # embed hundreds of MB of SDK sources in each end-user codec download.
+    $sourceName = Split-Path -Leaf $sourceArchive
+    $sourceUrl = $SourceDownloadBaseUrl.TrimEnd('/') + '/' + $sourceName
+    $sourceHash = (Get-FileHash -LiteralPath $sourceArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+    @("Corresponding source: $sourceName", "SHA256: $sourceHash", "Release URL: $sourceUrl",
+      'Release gate: publish and verify this source archive before distributing the installer.') |
+        Set-Content -LiteralPath (Join-Path $sourcesDir 'SOURCE.txt') -Encoding UTF8
     Copy-Item -LiteralPath $resolvedBuildManifest `
         -Destination (Join-Path $sourcesDir "repc-ffmpeg-codec-build.json") -Force
 
@@ -240,13 +259,15 @@ try {
         version = $Version
         architecture = $Architecture
         licenseBoundary = "GPL FFmpeg with libx264 and libx265"
-        installRoot = "%LOCALAPPDATA%\ForPro\RePC\codecs\ffmpeg\$Architecture"
+        installRoot = "%ProgramW6432%\ForPro\RePC\codecs\ffmpeg\$Architecture\$Version"
         ffmpegRevision = [string]$codecBuild.ffmpegRevision
         x264Revision = [string]$codecBuild.x264Revision
         x265Revision = [string]$codecBuild.x265Revision
         configuration = $configuration
         encoders = $encoders
         sourceBundle = Split-Path -Leaf $sourceArchive
+        sourceSha256 = $sourceHash
+        sourceUrl = $sourceUrl
         files = $files
     }
     $manifest | ConvertTo-Json -Depth 6 |
@@ -256,11 +277,13 @@ try {
 RePC optional FFmpeg x264/x265 codec pack
 
 Architecture: $Architecture
-Install path: %LOCALAPPDATA%\ForPro\RePC\codecs\ffmpeg\$Architecture
+Install path: %ProgramW6432%\ForPro\RePC\codecs\ffmpeg\$Architecture\$Version
 
 This GPL codec pack is distributed separately from the RePC base installer.
 Separation does not remove FFmpeg, x264, or x265 license obligations. The exact
-source archive, license texts, build manifest, notices, and hashes are included.
+source archive is a separate release artifact; its URL and SHA256, license
+texts, build manifest, notices, and hashes are included. Publish and verify the
+source URL before releasing the installer.
 H.264/HEVC patent licensing may apply separately.
 "@
     Set-Content -LiteralPath (Join-Path $stageDir "README.txt") `
@@ -294,13 +317,21 @@ H.264/HEVC patent licensing may apply separately.
             }
         }
         & $resolvedNsisCompiler `
-            "/DREPC_ARCH=$Architecture" `
-            "/DREPC_VERSION=$Version" `
-            "/DREPC_STAGE_DIR=$stageDir" `
-            "/DREPC_OUT_FILE=$setupPath" `
+            "-INPUTCHARSET" "UTF8" `
+            "-DREPC_ARCH=$Architecture" `
+            "-DREPC_VERSION=$Version" `
+            "-DREPC_STAGE_DIR=$stageDir" `
+            "-DREPC_OUT_FILE=$setupPath" `
             (Join-Path $packageRoot "packaging\ffmpeg-codec-pack.nsi")
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setupPath)) {
             throw "NSIS codec-pack build failed"
+        }
+        if ($Sign) {
+            if (-not $SignToolPath) { $SignToolPath = (Get-Command signtool.exe -ErrorAction Stop).Source }
+            & $SignToolPath sign /sha1 $CertificateThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $setupPath
+            if ($LASTEXITCODE -ne 0) { throw 'Codec installer signing failed' }
+            & $SignToolPath verify /pa $setupPath
+            if ($LASTEXITCODE -ne 0) { throw 'Codec installer signature verification failed' }
         }
         Copy-Item -LiteralPath $setupPath -Destination $stableSetupPath -Force
     } elseif ($RequireNsis) {

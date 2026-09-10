@@ -13,6 +13,21 @@
       "revision": "0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee",
       "licenseFile": "COPYING"
     },
+    "nvcodec": {
+      "repository": "https://github.com/FFmpeg/nv-codec-headers.git",
+      "revision": "e844e5b26f46bb77479f063029595293aa8f812d",
+      "licenseFile": "include/ffnvcodec/dynlink_loader.h"
+    },
+    "vpl": {
+      "repository": "https://github.com/intel/libvpl.git",
+      "revision": "c45b5d786bf7cdabbe49ff1bab78693ad78feb78",
+      "licenseFile": "LICENSE"
+    },
+    "amf": {
+      "repository": "https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git",
+      "revision": "eadd00804d5f7e5cd8c85d540073198312870776",
+      "licenseFile": "LICENSE.txt"
+    },
     "x265": {
       "repository": "https://bitbucket.org/multicoreware/x265_git.git",
       "revision": "b81f650e21e8aacbe6a9ad04ce14aefc05b932c0",
