@@ -17,7 +17,7 @@ param(
     [string]$CertificateThumbprint = $(if ($env:REPC_SIGN_THUMBPRINT) { $env:REPC_SIGN_THUMBPRINT } else { "A90AD3756DF6A5585DE261DB74D94EBE3823A6E1" }),
     [string]$SignToolPath = "",
     [string]$TimestampUrl = "http://timestamp.digicert.com",
-    [string]$SourceDownloadBaseUrl = "https://forpro.remote-pc.co.kr/updates/remote/codecs/"
+    [string]$SourceDownloadBaseUrl = "https://api.forpro-remote.com/updates/remote/download/windows/codecs/$Architecture/"
 )
 
 $ErrorActionPreference = "Stop"
