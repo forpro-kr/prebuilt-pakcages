@@ -48,6 +48,10 @@ Assert-Contains $buildScript "--enable-libx265"
 Assert-Contains $buildScript "repc-codec-avcodec-62.dll"
 Assert-Contains $buildScript "SLIBNAME_WITH_MAJOR=repc-codec-"
 Assert-Contains $buildScript "ffmpeg_namespace_ready"
+Assert-Contains $buildScript "repc-continuous-bitrate-patch.sha256"
+Assert-Contains $buildScript "continuousBitratePatchSha256"
+Assert-Contains $packageScript "continuousBitratePatchSha256"
+Assert-Contains $buildScript "0003-continuous-bitrate.patch"
 Assert-Contains $buildScript 'objdump -p'
 Assert-Contains $buildScript "-static-libstdc++"
 foreach ($runtimeName in @("libx264-165.dll", "libx265.dll")) {

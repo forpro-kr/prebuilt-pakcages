@@ -1,0 +1,333 @@
+--- a/libavcodec/amfenc.c
++++ b/libavcodec/amfenc.c
+@@ -670,6 +670,113 @@
+     return ret;
+ }
+ 
++/* RePC opt-in contract: update existing AMF properties before taking an input
++ * frame. A failed transaction either restores verified properties or poisons
++ * the session; submitting with an unknown rate-control state is not allowed. */
++static int repc_amf_get_rate(AMFComponent *encoder, const wchar_t *name, int64_t *value)
++{
++    AMFVariantStruct var = { 0 };
++    AMF_RESULT res = encoder->pVtbl->GetProperty(encoder, name, &var);
++    int valid = res == AMF_OK && var.type == AMF_VARIANT_INT64;
++    if (valid)
++        *value = var.int64Value;
++    AMFVariantClear(&var);
++    return valid ? 0 : AVERROR_EXTERNAL;
++}
++
++static int repc_amf_set_rate(AMFComponent *encoder, const wchar_t *name, int64_t value)
++{
++    AMFVariantStruct var = { 0 };
++    AMFVariantAssignInt64(&var, value);
++    return encoder->pVtbl->SetProperty(encoder, name, var) == AMF_OK ? 0 : AVERROR_EXTERNAL;
++}
++
++static void repc_amf_rate_names(AVCodecContext *avctx, const wchar_t **target, const wchar_t **peak)
++{
++    const int hevc = avctx->codec_id == AV_CODEC_ID_HEVC;
++    *target = hevc ? AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE : AMF_VIDEO_ENCODER_TARGET_BITRATE;
++    *peak   = hevc ? AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE : AMF_VIDEO_ENCODER_PEAK_BITRATE;
++}
++
++void ff_amf_repc_init_bitrate(AVCodecContext *avctx)
++{
++    AMFEncoderContext *ctx = avctx->priv_data;
++    const wchar_t *target, *peak;
++    repc_amf_rate_names(avctx, &target, &peak);
++    if (repc_amf_get_rate(ctx->encoder, target, &ctx->repc_applied_bitrate) < 0)
++        ctx->repc_applied_bitrate = 0;
++    if (repc_amf_get_rate(ctx->encoder, peak, &ctx->repc_applied_peak_rate) < 0)
++        ctx->repc_applied_peak_rate = 0;
++}
++
++static int repc_amf_update_bitrate(AVCodecContext *avctx)
++{
++    AMFEncoderContext *ctx = avctx->priv_data;
++    const wchar_t *target, *peak;
++    int64_t old_target, old_peak, actual_target, actual_peak;
++    int64_t requested_peak;
++    int rollback_target, rollback_peak, updated;
++
++    if (!ctx->repc_continuous_bitrate)
++        return 0;
++    if (ctx->repc_applied_bitrate < 0)
++        return AVERROR_EXTERNAL;
++    if (avctx->bit_rate <= 0)
++        return AVERROR(EINVAL);
++    requested_peak = FFMAX(avctx->rc_max_rate, avctx->bit_rate);
++    if (ctx->repc_applied_bitrate == avctx->bit_rate && ctx->repc_applied_peak_rate == requested_peak)
++        return 0;
++    repc_amf_rate_names(avctx, &target, &peak);
++    if (repc_amf_get_rate(ctx->encoder, target, &old_target) < 0 ||
++        repc_amf_get_rate(ctx->encoder, peak, &old_peak) < 0)
++        return AVERROR_EXTERNAL;
++    ctx->repc_applied_bitrate = old_target;
++    ctx->repc_applied_peak_rate = old_peak;
++    if (old_target == avctx->bit_rate && old_peak == requested_peak)
++        return 0;
++    if ((avctx->codec_id == AV_CODEC_ID_H264 && ctx->rate_control_mode == AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CONSTANT_QP) ||
++        (avctx->codec_id == AV_CODEC_ID_HEVC && ctx->rate_control_mode == AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CONSTANT_QP))
++        return AVERROR(ENOSYS);
++
++    /* Keep VBV and static initialization properties unchanged. Lower target
++     * first on a decrease, raise peak first on an increase. No IDR is requested. */
++    if (avctx->bit_rate < old_target)
++        updated = repc_amf_set_rate(ctx->encoder, target, avctx->bit_rate) == 0 &&
++                  repc_amf_set_rate(ctx->encoder, peak, requested_peak) == 0;
++    else
++        updated = repc_amf_set_rate(ctx->encoder, peak, requested_peak) == 0 &&
++                  repc_amf_set_rate(ctx->encoder, target, avctx->bit_rate) == 0;
++    if (updated &&
++        repc_amf_get_rate(ctx->encoder, target, &actual_target) == 0 &&
++        repc_amf_get_rate(ctx->encoder, peak, &actual_peak) == 0 &&
++        actual_target == avctx->bit_rate && actual_peak == requested_peak) {
++        ctx->repc_applied_bitrate = actual_target;
++        ctx->repc_applied_peak_rate = actual_peak;
++        return 0;
++    }
++
++    /* Both setters must run even if the first rollback fails. */
++    if (avctx->bit_rate < old_target) {
++        rollback_peak   = repc_amf_set_rate(ctx->encoder, peak, old_peak);
++        rollback_target = repc_amf_set_rate(ctx->encoder, target, old_target);
++    } else {
++        rollback_target = repc_amf_set_rate(ctx->encoder, target, old_target);
++        rollback_peak   = repc_amf_set_rate(ctx->encoder, peak, old_peak);
++    }
++    if (rollback_target == 0 && rollback_peak == 0 &&
++        repc_amf_get_rate(ctx->encoder, target, &actual_target) == 0 &&
++        repc_amf_get_rate(ctx->encoder, peak, &actual_peak) == 0 &&
++        actual_target == old_target && actual_peak == old_peak) {
++        avctx->bit_rate = old_target;
++        avctx->rc_max_rate = old_peak;
++        av_log(avctx, AV_LOG_ERROR, "AMF live bitrate update rejected; previous properties restored\n");
++    } else {
++        ctx->repc_applied_bitrate = -1;
++        av_log(avctx, AV_LOG_ERROR, "AMF live bitrate rollback failed; encoder state is unknown\n");
++    }
++    return AVERROR_EXTERNAL;
++}
++
+ int ff_amf_receive_packet(AVCodecContext *avctx, AVPacket *avpkt)
+ {
+     AMFEncoderContext     *ctx = avctx->priv_data;
+@@ -686,6 +793,11 @@
+     if (!ctx->encoder){
+         av_frame_free(&frame);
+         return AVERROR(EINVAL);
++    }
++    ret = repc_amf_update_bitrate(avctx);
++    if (ret < 0) {
++        av_frame_free(&frame);
++        return ret;
+     }
+     // check if some outputs are available
+     av_fifo_read(ctx->output_list, &buffer, 1);
+--- a/libavcodec/amfenc.h
++++ b/libavcodec/amfenc.h
+@@ -62,6 +62,10 @@
+     int64_t             submitted_frame;
+     int64_t             encoded_frame;
+     AVFifo             *output_list;
++
++    int                 repc_continuous_bitrate;
++    int64_t             repc_applied_bitrate;
++    int64_t             repc_applied_peak_rate;
+ 
+     // common encoder options
+ 
+@@ -146,6 +150,7 @@
+ * Common encoder initization function
+ */
+ int ff_amf_encode_init(AVCodecContext *avctx);
++void ff_amf_repc_init_bitrate(AVCodecContext *avctx);
+ /**
+ * Common encoder termination function
+ */
+--- a/libavcodec/amfenc_h264.c
++++ b/libavcodec/amfenc_h264.c
+@@ -28,6 +28,8 @@
+ #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+ 
+ static const AVOption options[] = {
++    { "repc_continuous_bitrate", "Apply live bitrate changes without restarting the encoder", OFFSET(repc_continuous_bitrate), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE | AV_OPT_FLAG_RUNTIME_PARAM },
++    { "repc_applied_bitrate", "Last driver-confirmed bitrate, -1 means rollback failed", OFFSET(repc_applied_bitrate), AV_OPT_TYPE_INT64, { .i64 = 0 }, -1, INT64_MAX, VE | AV_OPT_FLAG_READONLY },
+     // Static
+     /// Usage
+     { "usage",          "Encoder Usage",        OFFSET(usage),  AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY_HIGH_QUALITY, VE, .unit = "usage" },
+@@ -620,6 +622,7 @@
+     buffer->pVtbl->Release(buffer);
+     var.pInterface->pVtbl->Release(var.pInterface);
+ 
++    ff_amf_repc_init_bitrate(avctx);
+     return 0;
+ }
+ 
+--- a/libavcodec/amfenc_hevc.c
++++ b/libavcodec/amfenc_hevc.c
+@@ -27,6 +27,8 @@
+ #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+ 
+ static const AVOption options[] = {
++    { "repc_continuous_bitrate", "Apply live bitrate changes without restarting the encoder", OFFSET(repc_continuous_bitrate), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE | AV_OPT_FLAG_RUNTIME_PARAM },
++    { "repc_applied_bitrate", "Last driver-confirmed bitrate, -1 means rollback failed", OFFSET(repc_applied_bitrate), AV_OPT_TYPE_INT64, { .i64 = 0 }, -1, INT64_MAX, VE | AV_OPT_FLAG_READONLY },
+     { "usage",                   "Set the encoding usage",       OFFSET(usage), AV_OPT_TYPE_INT,   {.i64 = -1 }, -1, AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY_HIGH_QUALITY, VE, .unit = "usage" },
+     { "transcoding",             "Generic Transcoding",                      0, AV_OPT_TYPE_CONST, {.i64 = AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING               }, 0, 0, VE, .unit = "usage" },
+     { "ultralowlatency",         "Ultra low latency usecase",                0, AV_OPT_TYPE_CONST, {.i64 = AMF_VIDEO_ENCODER_HEVC_USAGE_ULTRA_LOW_LATENCY         }, 0, 0, VE, .unit = "usage" },
+@@ -535,6 +537,7 @@
+     buffer->pVtbl->Release(buffer);
+     var.pInterface->pVtbl->Release(var.pInterface);
+ 
++    ff_amf_repc_init_bitrate(avctx);
+     return 0;
+ }
+ static const FFCodecDefault defaults[] = {
+--- a/libavcodec/nvenc.c
++++ b/libavcodec/nvenc.c
+@@ -2294,6 +2294,7 @@
+             return ret;
+     }
+ 
++    ctx->repc_applied_bitrate = ctx->encode_config.rcParams.averageBitRate;
+     return 0;
+ }
+ 
+@@ -2933,13 +2934,14 @@
+     return res;
+ }
+ 
+-static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
++static int reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
+ {
+     NvencContext *ctx = avctx->priv_data;
+     NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &ctx->nvenc_dload_funcs.nvenc_funcs;
+     NVENCSTATUS ret;
+ 
+     NV_ENC_RECONFIGURE_PARAMS params = { 0 };
++    NV_ENC_CONFIG next_config = ctx->encode_config;
+     int needs_reconfig = 0;
+     int needs_encode_config = 0;
+     int reconfig_bitrate = 0, reconfig_dar = 0;
+@@ -2947,6 +2949,17 @@
+ 
+     params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+     params.reInitEncodeParams = ctx->init_encode_params;
++    params.reInitEncodeParams.encodeConfig = &next_config;
++
++    if (ctx->repc_continuous_bitrate &&
++        (avctx->bit_rate <= 0 || avctx->bit_rate > UINT32_MAX || avctx->rc_max_rate > UINT32_MAX))
++        return AVERROR(EINVAL);
++    if (ctx->repc_continuous_bitrate &&
++        (ctx->rc == NV_ENC_PARAMS_RC_CONSTQP || !ctx->support_dyn_bitrate) &&
++        (avctx->bit_rate != ctx->encode_config.rcParams.averageBitRate ||
++         (avctx->rc_max_rate > 0 && avctx->rc_max_rate != ctx->encode_config.rcParams.maxBitRate) ||
++         (avctx->rc_buffer_size > 0 && avctx->rc_buffer_size != ctx->encode_config.rcParams.vbvBufferSize)))
++        return AVERROR(ENOSYS);
+ 
+     compute_dar(avctx, &dw, &dh);
+     if (dw != ctx->init_encode_params.darWidth || dh != ctx->init_encode_params.darHeight) {
+@@ -2994,8 +3007,15 @@
+         }
+ 
+         if (reconfig_bitrate) {
+-            params.resetEncoder = 1;
+-            params.forceIDR = 1;
++            /* A pure reduction does not discard encoder references or inject
++             * an IDR at precisely the moment network capacity has fallen. */
++            int continuous_decrease = ctx->repc_continuous_bitrate && !reconfig_dar &&
++                next_config.rcParams.averageBitRate < ctx->encode_config.rcParams.averageBitRate &&
++                (next_config.rcParams.maxBitRate ? next_config.rcParams.maxBitRate : next_config.rcParams.averageBitRate) <=
++                (ctx->encode_config.rcParams.maxBitRate ? ctx->encode_config.rcParams.maxBitRate : ctx->encode_config.rcParams.averageBitRate) &&
++                next_config.rcParams.vbvBufferSize <= ctx->encode_config.rcParams.vbvBufferSize;
++            params.resetEncoder = !continuous_decrease;
++            params.forceIDR = !continuous_decrease;
+ 
+             needs_encode_config = 1;
+             needs_reconfig = 1;
+@@ -3008,7 +3028,9 @@
+     if (needs_reconfig) {
+         ret = p_nvenc->nvEncReconfigureEncoder(ctx->nvencoder, &params);
+         if (ret != NV_ENC_SUCCESS) {
+-            nvenc_print_error(avctx, ret, "failed to reconfigure nvenc");
++            int error = nvenc_print_error(avctx, ret, "failed to reconfigure nvenc");
++            if (ctx->repc_continuous_bitrate)
++                return error < 0 ? error : AVERROR_EXTERNAL;
+         } else {
+             if (reconfig_dar) {
+                 ctx->init_encode_params.darHeight = dh;
+@@ -3019,10 +3041,12 @@
+                 ctx->encode_config.rcParams.averageBitRate = params.reInitEncodeParams.encodeConfig->rcParams.averageBitRate;
+                 ctx->encode_config.rcParams.maxBitRate = params.reInitEncodeParams.encodeConfig->rcParams.maxBitRate;
+                 ctx->encode_config.rcParams.vbvBufferSize = params.reInitEncodeParams.encodeConfig->rcParams.vbvBufferSize;
++                ctx->repc_applied_bitrate = ctx->encode_config.rcParams.averageBitRate;
+             }
+ 
+         }
+     }
++    return 0;
+ }
+ 
+ #ifdef NVENC_HAVE_HEVC_AND_AV1_MASTERING_METADATA
+@@ -3123,15 +3147,23 @@
+         return AVERROR(EINVAL);
+ 
+     if (frame && frame->buf[0]) {
+-        in_surf = get_free_frame(ctx);
+-        if (!in_surf)
++        if (!av_fifo_can_read(ctx->unused_surface_queue))
+             return AVERROR(EAGAIN);
+ 
+         res = nvenc_push_context(avctx);
+         if (res < 0)
+             return res;
+ 
+-        reconfig_encoder(avctx, frame);
++        res = reconfig_encoder(avctx, frame);
++        if (res < 0) {
++            nvenc_pop_context(avctx);
++            return res;
++        }
++        in_surf = get_free_frame(ctx);
++        if (!in_surf) {
++            nvenc_pop_context(avctx);
++            return AVERROR(EAGAIN);
++        }
+ 
+         res = nvenc_upload_frame(avctx, frame, in_surf);
+ 
+--- a/libavcodec/nvenc.h
++++ b/libavcodec/nvenc.h
+@@ -211,6 +211,8 @@
+ typedef struct NvencContext
+ {
+     AVClass *avclass;
++    int repc_continuous_bitrate;
++    int64_t repc_applied_bitrate;
+ 
+     NvencDynLoadFunctions nvenc_dload_funcs;
+ 
+--- a/libavcodec/nvenc_h264.c
++++ b/libavcodec/nvenc_h264.c
+@@ -26,6 +26,8 @@
+ #define OFFSET(x) offsetof(NvencContext, x)
+ #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+ static const AVOption options[] = {
++    { "repc_continuous_bitrate", "Apply live bitrate changes without restarting the encoder", OFFSET(repc_continuous_bitrate), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE | AV_OPT_FLAG_RUNTIME_PARAM },
++    { "repc_applied_bitrate", "Last driver-confirmed bitrate, -1 means rollback failed", OFFSET(repc_applied_bitrate), AV_OPT_TYPE_INT64, { .i64 = 0 }, -1, INT64_MAX, VE | AV_OPT_FLAG_READONLY },
+ #ifdef NVENC_HAVE_NEW_PRESETS
+     { "preset",       "Set the encoding preset",            OFFSET(preset),       AV_OPT_TYPE_INT,   { .i64 = PRESET_P4 },     PRESET_DEFAULT, PRESET_P7,          VE, .unit = "preset" },
+ #else
+--- a/libavcodec/nvenc_hevc.c
++++ b/libavcodec/nvenc_hevc.c
+@@ -26,6 +26,8 @@
+ #define OFFSET(x) offsetof(NvencContext, x)
+ #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+ static const AVOption options[] = {
++    { "repc_continuous_bitrate", "Apply live bitrate changes without restarting the encoder", OFFSET(repc_continuous_bitrate), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE | AV_OPT_FLAG_RUNTIME_PARAM },
++    { "repc_applied_bitrate", "Last driver-confirmed bitrate, -1 means rollback failed", OFFSET(repc_applied_bitrate), AV_OPT_TYPE_INT64, { .i64 = 0 }, -1, INT64_MAX, VE | AV_OPT_FLAG_READONLY },
+ #ifdef NVENC_HAVE_NEW_PRESETS
+     { "preset",       "Set the encoding preset",            OFFSET(preset),       AV_OPT_TYPE_INT,   { .i64 = PRESET_P4 },     PRESET_DEFAULT, PRESET_P7,          VE, .unit = "preset" },
+ #else

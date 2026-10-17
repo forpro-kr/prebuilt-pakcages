@@ -140,6 +140,12 @@ foreach ($flag in @($lock.requiredFfmpegConfiguration)) {
 }
 $encoders = @($codecBuild.encoders | ForEach-Object { [string]$_ })
 if ($Architecture -eq 'x64') {
+    $continuousPatch = Join-Path $packageRoot 'patches\0003-continuous-bitrate.patch'
+    $expectedContinuousHash = (Get-FileHash -LiteralPath $continuousPatch -Algorithm SHA256).Hash.ToLowerInvariant()
+    $continuousHashProperty = $codecBuild.PSObject.Properties['continuousBitratePatchSha256']
+    if ($null -eq $continuousHashProperty -or [string]$continuousHashProperty.Value -ne $expectedContinuousHash) {
+        throw 'Codec runtime must be rebuilt with the current continuous bitrate patch before packaging'
+    }
     foreach ($encoder in @('h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'hevc_qsv', 'h264_amf', 'hevc_amf')) {
         if ($encoder -notin $encoders) { throw "Missing hardware encoder: $encoder" }
     }

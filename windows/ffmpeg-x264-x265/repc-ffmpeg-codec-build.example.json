@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "architecture": "arm64",
+  "continuousBitratePatchSha256": "",
   "ffmpegRevision": "dd00a614e16a15db0b230dfe45790e913e593695",
   "x264Revision": "0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee",
   "x265Revision": "b81f650e21e8aacbe6a9ad04ce14aefc05b932c0",

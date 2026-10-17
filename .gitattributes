@@ -4,3 +4,5 @@
 *.nsi text eol=crlf
 *.json text eol=lf
 *.md text eol=lf
+# Keep the validated patch hash stable; blank diff context lines contain a required space.
+windows/ffmpeg-x264-x265/patches/0003-continuous-bitrate.patch text eol=lf whitespace=-blank-at-eol

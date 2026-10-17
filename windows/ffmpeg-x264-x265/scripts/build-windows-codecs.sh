@@ -133,10 +133,14 @@ fi
 package_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 mf_patches=("$package_root/patches/0001-mf-low-delay.patch" "$package_root/patches/0002-mf-upstream-fixes.patch")
 mf_patch_hash=""
+continuous_patch="$package_root/patches/0003-continuous-bitrate.patch"
+continuous_patch_hash=""
 mf_configuration=""
 encoder_json='"libx264", "libx265"'
 vendor_configuration=""
 if [[ "$architecture" == "x64" ]]; then
+  command -v patch >/dev/null || { echo "required MSYS2 tool is missing: patch"; exit 3; }
+  continuous_patch_hash="$(sha256sum "$continuous_patch" | cut -d' ' -f1)"
   vendor_configuration=" --enable-ffnvcodec --enable-nvenc --enable-amf --enable-libvpl --enable-encoder=h264_nvenc,hevc_nvenc,h264_qsv,hevc_qsv,h264_amf,hevc_amf"
   encoder_json+=', "h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"'
 fi
@@ -155,6 +159,8 @@ ffmpeg_namespace_ready() {
   if [[ "$architecture" == "x64" ]]; then
     [[ -f "$prefix/repc-vendor-configuration.txt" ]] || return 1
     [[ "$(<"$prefix/repc-vendor-configuration.txt")" == "$vendor_configuration" ]] || return 1
+    [[ -f "$prefix/repc-continuous-bitrate-patch.sha256" ]] || return 1
+    [[ "$(<"$prefix/repc-continuous-bitrate-patch.sha256")" == "$continuous_patch_hash" ]] || return 1
   fi
   if [[ "$architecture" == "arm64" ]]; then
     [[ -f "$prefix/repc-mf-patch.sha256" ]] || return 1
@@ -194,15 +200,20 @@ if ! ffmpeg_namespace_ready; then
   mkdir -p "$ffmpeg_build"
   ffmpeg_source="$source_root/ffmpeg"
   ffmpeg_extra=()
+  # All patched builds export the exact locked source. The shared checkout is
+  # never edited and corresponding-source ZIPs include this patch and script.
+  expected_ffmpeg="$(python -c "import json; print(json.load(open(r'$(cygpath -m "$build_lock")'))['components']['ffmpeg']['revision'])")"
+  test "$(git -C "$source_root/ffmpeg" rev-parse HEAD)" = "$expected_ffmpeg"
+  ffmpeg_source="$ffmpeg_build/source"
+  mkdir -p "$ffmpeg_source"
+  git -C "$source_root/ffmpeg" archive --format=tar HEAD | tar -xf - -C "$ffmpeg_source"
   if [[ "$architecture" == "x64" ]]; then
+    patch --batch --forward -d "$ffmpeg_source" -p1 -i "$continuous_patch"
     ffmpeg_extra=(--enable-ffnvcodec --enable-nvenc --enable-amf --enable-libvpl --enable-encoder=h264_nvenc,hevc_nvenc,h264_qsv,hevc_qsv,h264_amf,hevc_amf)
   fi
   if [[ "$architecture" == "arm64" ]]; then
     # Export pinned source; never mutate the shared upstream checkout. This
     # patch ships in the package source archive with the build instructions.
-    ffmpeg_source="$ffmpeg_build/source"
-    mkdir -p "$ffmpeg_source"
-    git -C "$source_root/ffmpeg" archive --format=tar HEAD | tar -xf - -C "$ffmpeg_source"
     # git apply inside a parent repository can silently skip exported paths.
     for mf_patch in "${mf_patches[@]}"; do
       patch --batch --forward -d "$ffmpeg_source" -p1 -i "$mf_patch"
@@ -255,6 +266,7 @@ if ! ffmpeg_namespace_ready; then
   make install
   if [[ "$architecture" == "x64" ]]; then
     printf '%s\n' "$vendor_configuration" > "$prefix/repc-vendor-configuration.txt"
+    printf '%s\n' "$continuous_patch_hash" > "$prefix/repc-continuous-bitrate-patch.sha256"
   fi
   if [[ "$architecture" == "arm64" ]]; then
     printf '%s\n' "$mf_patch_hash" > "$prefix/repc-mf-patch.sha256"
@@ -330,6 +342,7 @@ cat >"$runtime/repc-ffmpeg-codec-build.json" <<EOF
   "configuration": "--enable-gpl --enable-shared --disable-static --enable-libx264 --enable-libx265$mf_configuration$vendor_configuration",
   "encoders": [$encoder_json],
   "mfLowDelayPatchSha256": "$mf_patch_hash",
+  "continuousBitratePatchSha256": "$continuous_patch_hash",
   "runtimeFiles": [$runtime_json],
   "toolchain": {
     "environment": "${MSYSTEM:-unknown}",

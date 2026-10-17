@@ -1,5 +1,43 @@
 # Build status
 
+## 2026-10-18 x64 continuous bitrate validation
+
+- Implemented opt-in `repc_continuous_bitrate` for AMF/NVENC H.264/HEVC,
+  with driver-confirmed `repc_applied_bitrate` and explicit error/rollback behavior.
+- Exact pinned FFmpeg export plus `0003-continuous-bitrate.patch` built with
+  UCRT64 GCC 15.2.0, `build-windows-codecs.ps1 -Architecture x64 -Parallel 12`:
+  **PASS**. The original `build/sources/ffmpeg` checkout remains clean.
+- x64 `repc-codec-avcodec-62.dll` SHA-256:
+  `c1560e7915cadc1df459fbe87515737327a5a673136c97be88938f1be7aeae31`.
+  After the full build, the NVENC queue-capacity preflight was added, its object
+  and DLL rebuilt incrementally, and the build script's final validation/staging
+  passed again. The final runtime and manifest use this corrected patch.
+- `test-continuous-bitrate.py` compiled the production update functions against
+  vendor headers and passed fake-dispatch transaction/failure/rollback checks.
+  NVENC policy cases include both 60 and 120 FPS buffer sizes.
+- The built DLLs passed public-option probing for all four encoders, including
+  rejection of writes to the applied-rate read-only option. This probe allocates
+  codec contexts but does not open a hardware encoder.
+- `test-package-contract.ps1`, Bash syntax and `git diff --check`: **PASS**.
+- Runtime output: `build/windows-codecs/x64/runtime`. Build manifest patch hash
+  is checked against patch bytes; x64 packaging rejects a stale manifest.
+- RePC GPU integration on RTX 3080 (driver 32.0.16.1088): patched FFmpeg
+  H.264/HEVC at both 60/120 FPS settings, 1280x720, 8 to 3 Mbps, **4/4 PASS**.
+  Each run encoded and hardware-decoded 60 frames with only the initial keyframe,
+  applied rate 3000 Kbps, no pending change and no bitrate recovery restart.
+  Evidence: sibling `repc/build/parsec-encoder-bitrate-20261018/gpu-continuity-results.json`.
+- **Runtime acceptance pending:** actual AMD hardware, sustained bitrate convergence,
+  P99 frame submission time and actual two-PC simultaneous display streams.
+  No service replacement, installer/source archive creation, signing or public
+  release was performed by this validation.
+
+Commands:
+
+```powershell
+python windows/ffmpeg-x264-x265/tests/test-continuous-bitrate.py --build-dir build/windows-codecs/x64 --compiler C:/msys64/ucrt64/bin/gcc.exe --runtime-dir build/windows-codecs/x64/runtime
+./windows/ffmpeg-x264-x265/tests/test-package-contract.ps1
+```
+
 기준일: 2026-07-27
 
 ## 완료

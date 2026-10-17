@@ -1,5 +1,16 @@
 # RePC Windows FFmpeg x264/x265 codec pack
 
+## 2026-10-18 x64 live bitrate updates
+
+`0003-continuous-bitrate.patch` adds opt-in AMF/NVENC H.264/HEVC live updates.
+AMF updates and verifies existing target/peak properties; NVENC pure decreases
+preserve references without requesting reset/IDR. Vendor failures propagate and
+the read-only applied bitrate reports confirmed state. Apps must detect the
+option before using this contract. Patch hashing invalidates the x64 build
+cache and prevents packaging a stale runtime with new corresponding sources.
+See [patch contract and tests](patches/README.md) for rollback semantics and
+the separate hardware acceptance requirements.
+
 ## 2026-09-10 Windows x64 확장
 
 - x64 UCRT/GCC 팩에 FFmpeg NVENC/QSV/AMF(H.264/HEVC)를 추가했다. x264/x265는 마지막 소프트웨어 폴백이다. NVIDIA/AMD/Intel 드라이버 자체는 포함하지 않는다.
