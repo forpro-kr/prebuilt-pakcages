@@ -1,5 +1,18 @@
 # Build status
 
+## 2026-10-28 AirDesk codec path staging
+
+- New source targets `%ProgramW6432%\AirDesk\codecs\ffmpeg\<arch>\<version>` and
+  HKLM64 `Software\AirDesk\FFmpegCodecPack\<arch>` with an owned AirDesk uninstall entry.
+- New artifact names use `AirDesk-ffmpeg-*`; namespaced DLLs and GPL source/license
+  contracts are unchanged. The immutable signed public x64 `0.1.1` installer and
+  its legacy install/uninstall ownership are not rewritten or republished.
+- Local cache inspection: x64 runtime exists but its build manifest has no
+  `packageVersion`; ARM64 runtime is absent. Real `0.1.2` packaging remains pending
+  a lock-matching rebuild. Plan/contract/synthetic NSIS compile validation must
+  not be reported as a functional, signed or published installer.
+- Source changes do not install, migrate, unregister, sign or publish any pack.
+
 ## 2026-10-18 x64 continuous bitrate validation
 
 - Implemented opt-in `repc_continuous_bitrate` for AMF/NVENC H.264/HEVC,

@@ -1,15 +1,15 @@
-# ForPro prebuilt packages
+# AirDesk prebuilt packages
 
-ForPro 제품에서 선택 설치하는 제3자 런타임의 빌드·라이선스·배포 저장소다.
+AirDesk 제품에서 선택 설치하는 제3자 런타임의 빌드·라이선스·배포 저장소다.
 
-RePC의 GPL FFmpeg/x264/x265 코덱 팩은 이 저장소가 소유한다. RePC 본체
+AirDesk의 GPL FFmpeg/x264/x265 코덱 팩은 이 저장소가 소유한다. AirDesk 본체
 저장소에는 코덱 팩을 빌드하거나 NSIS 설치 파일을 만드는 코드가 들어가지 않고,
 이 저장소가 만든 검증된 산출물만 release 입력으로 사용한다.
 
 ## 패키지
 
 - [`windows/ffmpeg-x264-x265`](windows/ffmpeg-x264-x265/README.md):
-  RePC Windows x64/ARM64용 GPL FFmpeg + libx264 + libx265 런타임과 NSIS 설치 파일
+  AirDesk Windows x64/ARM64용 GPL FFmpeg + libx264 + libx265 런타임과 NSIS 설치 파일
 
 각 package의 `BUILD_STATUS.md`는 구현 완료와 실제 binary/runtime acceptance를
 구분해서 기록한다.

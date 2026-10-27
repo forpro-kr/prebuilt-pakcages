@@ -16,7 +16,7 @@ param(
     [string]$CertificateThumbprint = $(if ($env:REPC_SIGN_THUMBPRINT) { $env:REPC_SIGN_THUMBPRINT } else { "A90AD3756DF6A5585DE261DB74D94EBE3823A6E1" }),
     [string]$SignToolPath = "",
     [string]$TimestampUrl = "http://timestamp.digicert.com",
-    [string]$SourceDownloadBaseUrl = "https://api.forpro-remote.com/updates/remote/download/windows/codecs/$Architecture/"
+    [string]$SourceDownloadBaseUrl = "https://api.airdesk.co.kr/updates/remote/download/windows/codecs/$Architecture/"
 )
 
 $ErrorActionPreference = "Stop"
@@ -113,7 +113,7 @@ $plan = [ordered]@{
     requiredConfiguration = @($lock.requiredFfmpegConfiguration)
     requiredEncoders = @($lock.requiredEncoders)
     requiredRuntimeFiles = @($lock.requiredRuntimeFiles)
-    installRoot = "%ProgramW6432%\ForPro\RePC\codecs\ffmpeg\$Architecture\$Version"
+    installRoot = "%ProgramW6432%\AirDesk\codecs\ffmpeg\$Architecture\$Version"
     nsis = "machine-wide versioned installer; /S supported"
 }
 if ($PlanOnly) {
@@ -246,7 +246,7 @@ try {
         -Destination (Join-Path $stageDir "THIRD_PARTY_NOTICES.md") -Force
 
     $sourceArchive = Join-Path $resolvedOutputDir (
-        "RePC-ffmpeg-$Architecture-$Version-source.zip"
+        "AirDesk-ffmpeg-$Architecture-$Version-source.zip"
     )
     Assert-SafeChildPath $resolvedOutputDir $sourceArchive
     if (Test-Path -LiteralPath $sourceArchive) {
@@ -276,11 +276,11 @@ try {
     })
     $manifest = [ordered]@{
         schema = 1
-        product = "RePC FFmpeg codec pack"
+        product = "AirDesk FFmpeg codec pack"
         version = $Version
         architecture = $Architecture
         licenseBoundary = "GPL FFmpeg with libx264 and libx265"
-        installRoot = "%ProgramW6432%\ForPro\RePC\codecs\ffmpeg\$Architecture\$Version"
+        installRoot = "%ProgramW6432%\AirDesk\codecs\ffmpeg\$Architecture\$Version"
         ffmpegRevision = [string]$codecBuild.ffmpegRevision
         x264Revision = [string]$codecBuild.x264Revision
         x265Revision = [string]$codecBuild.x265Revision
@@ -295,12 +295,12 @@ try {
         Set-Content -LiteralPath (Join-Path $stageDir "manifest.json") -Encoding UTF8
 
     $readme = @"
-RePC optional FFmpeg x264/x265 codec pack
+AirDesk optional FFmpeg x264/x265 codec pack
 
 Architecture: $Architecture
-Install path: %ProgramW6432%\ForPro\RePC\codecs\ffmpeg\$Architecture\$Version
+Install path: %ProgramW6432%\AirDesk\codecs\ffmpeg\$Architecture\$Version
 
-This GPL codec pack is distributed separately from the RePC base installer.
+This GPL codec pack is distributed separately from the AirDesk base installer.
 Separation does not remove FFmpeg, x264, or x265 license obligations. The exact
 source archive is a separate release artifact; its URL and SHA256, license
 texts, build manifest, notices, and hashes are included. Publish and verify the
@@ -310,7 +310,7 @@ H.264/HEVC patent licensing may apply separately.
     Set-Content -LiteralPath (Join-Path $stageDir "README.txt") `
         -Value $readme -Encoding UTF8
 
-    $archivePath = Join-Path $resolvedOutputDir "RePC-ffmpeg-$Architecture-$Version.zip"
+    $archivePath = Join-Path $resolvedOutputDir "AirDesk-ffmpeg-$Architecture-$Version.zip"
     Assert-SafeChildPath $resolvedOutputDir $archivePath
     if (Test-Path -LiteralPath $archivePath) {
         Remove-Item -LiteralPath $archivePath -Force
@@ -326,9 +326,9 @@ H.264/HEVC patent licensing may apply separately.
         }
     }
     $setupPath = Join-Path $resolvedOutputDir (
-        "RePC-ffmpeg-$Architecture-$Version-setup.exe"
+        "AirDesk-ffmpeg-$Architecture-$Version-setup.exe"
     )
-    $stableSetupPath = Join-Path $resolvedOutputDir "RePC-ffmpeg-$Architecture-setup.exe"
+    $stableSetupPath = Join-Path $resolvedOutputDir "AirDesk-ffmpeg-$Architecture-setup.exe"
     if (-not [string]::IsNullOrWhiteSpace($resolvedNsisCompiler) -and
         (Test-Path -LiteralPath $resolvedNsisCompiler)) {
         foreach ($path in @($setupPath, $stableSetupPath)) {
@@ -374,7 +374,7 @@ H.264/HEVC patent licensing may apply separately.
     Set-Content -LiteralPath (Join-Path $resolvedOutputDir "SHA256SUMS") `
         -Value $hashLines -Encoding ASCII
     Copy-IfDifferent $resolvedBuildManifest (
-        Join-Path $resolvedOutputDir "repc-ffmpeg-codec-build-$Architecture.json"
+        Join-Path $resolvedOutputDir "AirDesk-ffmpeg-codec-build-$Architecture.json"
     )
 
     Write-Host "Codec pack archive: $archivePath"

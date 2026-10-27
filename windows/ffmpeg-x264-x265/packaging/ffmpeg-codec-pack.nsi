@@ -15,13 +15,13 @@ RequestExecutionLevel admin
 !ifndef REPC_OUT_FILE
   !error "REPC_OUT_FILE is required"
 !endif
-!define PACK_KEY "Software\ForPro\RePC\FFmpegCodecPack\${REPC_ARCH}"
-!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\RePCFFmpegCodecPack-${REPC_ARCH}-${REPC_VERSION}"
-!define PACK_DIR "$PROGRAMFILES64\ForPro\RePC\codecs\ffmpeg\${REPC_ARCH}\${REPC_VERSION}"
-Name "forpro-remote FFmpeg 코덱 팩 (${REPC_ARCH})"
+!define PACK_KEY "Software\AirDesk\FFmpegCodecPack\${REPC_ARCH}"
+!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\AirDeskFFmpegCodecPack-${REPC_ARCH}-${REPC_VERSION}"
+!define PACK_DIR "$PROGRAMFILES64\AirDesk\codecs\ffmpeg\${REPC_ARCH}\${REPC_VERSION}"
+Name "AirDesk FFmpeg 코덱 팩 (${REPC_ARCH})"
 OutFile "${REPC_OUT_FILE}"
 InstallDir "${PACK_DIR}"
-BrandingText "forpro-remote"
+BrandingText "AirDesk"
 SetCompressor /SOLID lzma
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_WELCOME
@@ -77,9 +77,9 @@ Section "FFmpeg 하드웨어 및 소프트웨어 인코더" SEC_CODEC_PACK
   ; Switch only after successful extraction; running processes keep old DLLs.
   WriteRegStr HKLM "${PACK_KEY}" "InstallDir" "$INSTDIR"
   WriteRegStr HKLM "${PACK_KEY}" "Version" "${REPC_VERSION}"
-  WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "forpro-remote FFmpeg (${REPC_ARCH}) ${REPC_VERSION}"
+  WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "AirDesk FFmpeg (${REPC_ARCH}) ${REPC_VERSION}"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayVersion" "${REPC_VERSION}"
-  WriteRegStr HKLM "${UNINSTALL_KEY}" "Publisher" "ForPro"
+  WriteRegStr HKLM "${UNINSTALL_KEY}" "Publisher" "AirDesk"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKLM "${UNINSTALL_KEY}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
   WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoModify" 1
@@ -89,7 +89,7 @@ Section "FFmpeg 하드웨어 및 소프트웨어 인코더" SEC_CODEC_PACK
   Goto done
   failed:
     SetErrorLevel 1603
-    Abort "설치에 실패했습니다. RePC를 종료하고 다시 시도하세요."
+    Abort "설치에 실패했습니다. AirDesk를 종료하고 다시 시도하세요."
   done:
 SectionEnd
 Function un.onInit

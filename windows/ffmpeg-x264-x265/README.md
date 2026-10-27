@@ -1,4 +1,22 @@
-# RePC Windows FFmpeg x264/x265 codec pack
+# AirDesk Windows FFmpeg x264/x265 codec pack
+
+## AirDesk 0.1.2 staging — 2026-10-28
+
+현재 build lock `0.1.2`의 새 NSIS·manifest·산출물 이름은 AirDesk를 사용한다.
+앱의 현재 공개 `0.1.1` pin과 기존 설치/제거 소유권은 별도로 유지한다.
+loader는 새 AirDesk HKLM64 경로를 먼저 읽고, 없으면 기존 machine/user pack을 읽는다.
+DLL namespace `repc-codec-*`와 GPL 라이선스·소스 커밋·GitHub 저장소 ID는 바꾸지 않는다.
+
+`-PlanOnly`와 x64/ARM64 synthetic NSIS compile fixture는 설치 경로/제거 계약 검증이다.
+fixture EXE는 실제 코덱을 담은 배포 후보가 아니므로 실행·서명·게시하지 않는다.
+현재 x64 cached manifest에는 필수 `packageVersion`이 없고 ARM64 runtime cache도 없어
+실제 `0.1.2` 설치기는 lock에 맞는 runtime 재빌드 후에 생성해야 한다.
+캐시 manifest를 새 버전으로 relabel하거나 공개 `0.1.1` 파일을 덮어쓰지 않는다.
+
+배포 순서: lock과 일치하는 빌드/manifest → unsigned package → hash/PE/codec 검증 →
+회사 서명 및 timestamp 검증 → 대응 소스/manifest/installer 동시 게시 → 공개 bytes 검증 →
+앱 다운로드 URL·설치 SHA/pin 승인 전환 → 실제 새 설치/제거 및 legacy 호환 검증.
+이번 source 변경만으로 서명·배포·설치가 완료되었다고 표시하지 않는다.
 
 ## Package version
 
@@ -33,7 +51,7 @@ the separate hardware acceptance requirements.
 
 - x64 UCRT/GCC 팩에 FFmpeg NVENC/QSV/AMF(H.264/HEVC)를 추가했다. x264/x265는 마지막 소프트웨어 폴백이다. NVIDIA/AMD/Intel 드라이버 자체는 포함하지 않는다.
 - nv-codec-headers, AMF, oneVPL 소스도 build-lock으로 고정한다. oneVPL dispatcher는 정적으로 빌드한다.
-- 새 NSIS는 사용자별이 아닌 관리자 설치다: `%ProgramW6432%\ForPro\RePC\codecs\ffmpeg\<arch>\<version>`. HKLM 64-bit view의 활성 경로를 통해 SYSTEM 서비스와 사용자 앱이 같은 팩을 찾는다. 기존 버전은 자동 삭제하지 않는다.
+- 새 NSIS는 사용자별이 아닌 관리자 설치다: `%ProgramW6432%\AirDesk\codecs\ffmpeg\<arch>\<version>`. HKLM 64-bit view의 활성 경로를 통해 SYSTEM 서비스와 사용자 앱이 같은 팩을 찾는다. 기존 버전은 자동 삭제하지 않는다.
 - `/S`로 silent 설치가 가능하며 서비스 재시작은 하지 않는다. 메인 설치기의 다운로드 체크박스는 아직 연동하지 않았다.
 - `package-codec-pack.ps1 -Sign -SignToolPath <signtool.exe>`로 선택적 서명/검증 후 SHA256SUMS를 생성한다. 서명하지 않은 로컬 산출물은 공개 배포 승인으로 간주하지 않는다.
 - 아래 LocalAppData/ARM64 위주 내용은 이전 버전 이력이다. x64 실기기 인코딩과 NSIS acceptance는 별도로 기록한다.
@@ -72,22 +90,29 @@ libswscale 9 ABI와 맞춘다. 선택 팩은 앱 내장 decoder DLL과 충돌하
 architecture별 release에는 다음 파일을 함께 게시한다.
 
 ```text
-RePC-ffmpeg-<arch>-<version>.zip
-RePC-ffmpeg-<arch>-<version>-setup.exe
-RePC-ffmpeg-<arch>-setup.exe
-RePC-ffmpeg-<arch>-<version>-source.zip
-repc-ffmpeg-codec-build-<arch>.json
+AirDesk-ffmpeg-<arch>-<version>.zip
+AirDesk-ffmpeg-<arch>-<version>-setup.exe
+AirDesk-ffmpeg-<arch>-setup.exe
+AirDesk-ffmpeg-<arch>-<version>-source.zip
+AirDesk-ffmpeg-codec-build-<arch>.json
 SHA256SUMS
 ```
 
-`<arch>`는 `x64` 또는 `arm64`다. 버전 없는 setup 파일은 RePC UI의 stable URL이
-가리키는 release alias이며 내용은 같은 버전의 setup 파일과 동일해야 한다.
+`<arch>`는 `x64` 또는 `arm64`다. 버전 없는 setup 파일은 새 AirDesk release alias이며 내용은 같은 버전의 setup 파일과 동일해야 한다.
+서명·대응 소스 게시·공개 해시 검증 후 앱의 URL/pin을 이 별칭으로 전환한다.
 
-설치 경로:
+새 설치 경로와 활성 등록 키:
 
 ```text
-%LOCALAPPDATA%\ForPro\RePC\codecs\ffmpeg\<arch>
+%ProgramW6432%\AirDesk\codecs\ffmpeg\<arch>\<version>
+HKLM64\Software\AirDesk\FFmpegCodecPack\<arch>
 ```
+
+기존 서명된 `0.1.1`의 `ForPro\RePC` machine 경로/등록 키와
+`%LOCALAPPDATA%\ForPro\RePC\codecs\ffmpeg\<arch>`는 앱의 읽기 전용 호환 fallback이다.
+새 installer가 이 경로나 옛 uninstall entry를 수정·복사·이름 변경하지 않는다.
+기존 `RePC-ffmpeg-x64-0.1.1-setup.exe`의 공개 URL·SHA-256·서명은 불변이며
+AirDesk 경로를 설치하는 새 패키지라고 표기하지 않는다.
 
 ## 실행
 

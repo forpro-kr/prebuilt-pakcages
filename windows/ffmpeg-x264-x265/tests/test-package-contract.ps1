@@ -1,3 +1,4 @@
+param([string]$NsisCompilerPath = 'C:\msys64\ucrt64\bin\makensis.exe')
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
@@ -22,7 +23,7 @@ function Assert-Contains {
 $lock = Get-Content -LiteralPath (Join-Path $packageRoot "build-lock.json") `
     -Raw -Encoding UTF8 | ConvertFrom-Json
 if ([int]$lock.components.ffmpeg.expectedLibavcodecMajor -ne 62) {
-    throw "RePC package must stay on libavcodec major 62 until its delay-import ABI changes"
+    throw "AirDesk package must stay on libavcodec major 62 until its delay-import ABI changes"
 }
 foreach ($flag in @("--enable-gpl", "--enable-shared", "--enable-libx264", "--enable-libx265")) {
     if ($flag -notin @($lock.requiredFfmpegConfiguration)) {
@@ -42,7 +43,7 @@ Assert-Contains $packageScript "Get-PeMachine"
 Assert-Contains $packageScript "build-lock.json version"
 Assert-Contains $packageScript "packageVersion"
 Assert-Contains $packageScript "0xAA64"
-Assert-Contains $packageScript 'RePC-ffmpeg-$Architecture-setup.exe'
+Assert-Contains $packageScript 'AirDesk-ffmpeg-$Architecture-setup.exe'
 Assert-Contains $packageScript "makensis.exe"
 Assert-Contains $buildScript "--enable-gpl"
 Assert-Contains $buildScript "--enable-libx264"
@@ -68,7 +69,16 @@ foreach ($runtimeName in @("libx264-165.dll", "libx265.dll")) {
     }
 }
 Assert-Contains $nsis "RequestExecutionLevel admin"
-Assert-Contains $nsis '$PROGRAMFILES64\ForPro\RePC\codecs\ffmpeg\${REPC_ARCH}\${REPC_VERSION}'
+Assert-Contains $nsis '$PROGRAMFILES64\AirDesk\codecs\ffmpeg\${REPC_ARCH}\${REPC_VERSION}'
+Assert-Contains $nsis 'Software\AirDesk\FFmpegCodecPack\${REPC_ARCH}'
+Assert-Contains $nsis 'Uninstall\AirDeskFFmpegCodecPack-${REPC_ARCH}-${REPC_VERSION}'
+Assert-Contains $nsis '"Publisher" "AirDesk"'
+Assert-Contains $packageScript 'product = "AirDesk FFmpeg codec pack"'
+Assert-Contains $packageScript 'https://api.airdesk.co.kr/'
+Assert-Contains $packageScript 'AirDesk-ffmpeg-codec-build-$Architecture.json'
+foreach ($retired in @('Software\ForPro\RePC', '$PROGRAMFILES64\ForPro', 'forpro-remote')) {
+    if ($nsis.Contains($retired)) { throw "New installer still writes legacy branding/path: $retired" }
+}
 Assert-Contains $nsis 'SetRegView 64'
 Assert-Contains $nsis 'QuietUninstallString'
 Assert-Contains $nsis 'SetOverwrite off'
@@ -97,7 +107,7 @@ $planOutput = & $powershellCli @packagePlanArgs
 if ($LASTEXITCODE -ne 0) { throw 'Default package-version plan failed' }
 $packagePlan = $planOutput | ConvertFrom-Json
 if ([string]$packagePlan.version -ne [string]$lock.version -or
-    -not ([string]$packagePlan.installRoot).EndsWith("\$($lock.version)")) {
+    [string]$packagePlan.installRoot -ne "%ProgramW6432%\AirDesk\codecs\ffmpeg\x64\$($lock.version)") {
     throw 'Package version/install path did not follow the committed lock'
 }
 $otherVersion = if ([string]$lock.version -eq '0.0.0') { '0.0.1' } else { '0.0.0' }
@@ -124,6 +134,39 @@ $buildPlanOutput = & $powershellCli -NoProfile -File (Join-Path $packageRoot 'sc
     -Architecture x64 -PlanOnly
 if ($LASTEXITCODE -ne 0 -or [string](($buildPlanOutput | ConvertFrom-Json).version) -ne [string]$lock.version) {
     throw 'Build plan did not follow the committed package version'
+}
+
+$armPlanOutput = & $powershellCli -NoProfile -File $packagePath -Architecture arm64 `
+    -RuntimeDir 'build\version-contract\runtime' `
+    -BuildManifestPath 'build\version-contract\runtime\repc-ffmpeg-codec-build.json' -PlanOnly
+if ($LASTEXITCODE -ne 0 -or [string](($armPlanOutput | ConvertFrom-Json).installRoot) -ne
+    "%ProgramW6432%\AirDesk\codecs\ffmpeg\arm64\$($lock.version)") {
+    throw 'ARM64 package plan did not use the canonical AirDesk path'
+}
+
+if (Test-Path -LiteralPath $NsisCompilerPath) {
+    # These executables contain dummy data, never real codec payloads. They
+    # validate both NSIS architecture/ownership branches without installing.
+    $fixtureRoot = Join-Path $packageRoot ('..\..\build\airdesk-codec-nsis-fixture-' + [guid]::NewGuid().ToString('N'))
+    $fixtureRoot = [IO.Path]::GetFullPath($fixtureRoot)
+    $stage = Join-Path $fixtureRoot 'COMPILE-ONLY-stage'
+    foreach ($arch in @('x64', 'arm64')) {
+        $bin = Join-Path $stage "bin\$arch"
+        New-Item -ItemType Directory -Path $bin, (Join-Path $stage 'licenses'), (Join-Path $stage 'sources') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $bin 'repc-codec-avcodec-62.dll') -Value 'SYNTHETIC COMPILE ONLY; NOT A DLL' -Encoding ASCII
+        foreach ($file in @('README.txt', 'THIRD_PARTY_NOTICES.md', 'licenses\FFmpeg-COPYING.GPLv2.txt', 'sources\SOURCE.txt')) {
+            Set-Content -LiteralPath (Join-Path $stage $file) -Value 'SYNTHETIC COMPILE ONLY; DO NOT INSTALL OR DISTRIBUTE' -Encoding ASCII
+        }
+        @{ schema = 1; architecture = $arch; version = [string]$lock.version; syntheticCompileOnly = $true } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'manifest.json') -Encoding UTF8
+        $fixtureExe = Join-Path $fixtureRoot "AirDesk-ffmpeg-$arch-$($lock.version)-COMPILE-ONLY.exe"
+        & $NsisCompilerPath '-V2' '-INPUTCHARSET' 'UTF8' "-DREPC_ARCH=$arch" "-DREPC_VERSION=$($lock.version)" `
+            "-DREPC_STAGE_DIR=$stage" "-DREPC_OUT_FILE=$fixtureExe" (Join-Path $packageRoot 'packaging\ffmpeg-codec-pack.nsi')
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $fixtureExe)) { throw "Synthetic NSIS compile failed: $arch" }
+    }
+    Write-Output "airdesk_codec_nsis_compile_only=ok artifacts=$fixtureRoot"
+} else {
+    Write-Output 'airdesk_codec_nsis_compile_only=not-run (makensis unavailable)'
 }
 
 Write-Output "prebuilt_ffmpeg_codec_pack_contract=ok"
