@@ -1,0 +1,106 @@
+diff --git a/libavcodec/mfenc.c b/libavcodec/mfenc.c
+--- a/libavcodec/mfenc.c
++++ b/libavcodec/mfenc.c
+@@ -66,6 +66,8 @@
+     int opt_enc_hw;
+     int low_delay_pending;
+     int repc_low_delay_version;
++    int repc_vbr_peak_version;
++    int repc_require_cbr;
+     AVD3D11VADeviceContext* device_hwctx;
+ } MFContext;
+ 
+@@ -75,6 +77,51 @@
+ #define MF_TIMEBASE (AVRational){1, 10000000}
+ // Sentinel value only used by us.
+ #define MF_INVALID_TIME AV_NOPTS_VALUE
++
++// Peak-constrained VBR must retain both its average and peak after scenario
++// and media-type negotiation. A prepared replacement may fail without touching
++// the application's current encoder; never silently fall back to another RC.
++static int mf_repc_apply_rate_control(AVCodecContext *avctx)
++{
++    MFContext *c = avctx->priv_data;
++    const GUID *properties[] = {
++        &ff_CODECAPI_AVEncCommonRateControlMode,
++        &ff_CODECAPI_AVEncCommonMeanBitRate,
++        &ff_CODECAPI_AVEncCommonMaxBitRate,
++    };
++    uint32_t desired[3];
++    const int count = c->repc_require_cbr ? 1 : 3;
++
++    if (!c->repc_require_cbr && c->opt_enc_rc != ff_eAVEncCommonRateControlMode_PeakConstrainedVBR)
++        return 0;
++    if (!c->codec_api || (c->repc_require_cbr && c->opt_enc_rc != ff_eAVEncCommonRateControlMode_CBR))
++        return AVERROR(EINVAL);
++    if (!c->repc_require_cbr && (avctx->bit_rate <= 0 ||
++        avctx->rc_max_rate < avctx->bit_rate || avctx->rc_max_rate > UINT32_MAX))
++        return AVERROR(EINVAL);
++    desired[0] = c->repc_require_cbr ? ff_eAVEncCommonRateControlMode_CBR :
++        ff_eAVEncCommonRateControlMode_PeakConstrainedVBR;
++    desired[1] = avctx->bit_rate;
++    desired[2] = avctx->rc_max_rate;
++    for (int i = 0; i < count; ++i) {
++        HRESULT hr = ICodecAPI_SetValue(c->codec_api, properties[i], FF_VAL_VT_UI4(desired[i]));
++        if (FAILED(hr)) {
++            av_log(avctx, AV_LOG_ERROR, "MF rate-control property %d rejected: %s\n", i, ff_hr_str(hr));
++            return AVERROR(ENOSYS);
++        }
++    }
++    for (int i = 0; i < count; ++i) {
++        VARIANT actual = { 0 };
++        HRESULT hr = ICodecAPI_GetValue(c->codec_api, properties[i], &actual);
++        int matches = SUCCEEDED(hr) && actual.vt == VT_UI4 && actual.ulVal == desired[i];
++        VariantClear(&actual);
++        if (!matches) {
++            av_log(avctx, AV_LOG_ERROR, "MF rate-control property %d readback rejected\n", i);
++            return AVERROR(ENOSYS);
++        }
++    }
++    return 0;
++}
+ 
+ static int mf_wait_events(AVCodecContext *avctx, int want_output)
+ {
+@@ -707,6 +754,11 @@
+                 ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncCommonBufferSize, FF_VAL_VT_UI4(avctx->rc_buffer_size));
+             av_log(avctx, AV_LOG_INFO, "MF hardware low-delay active: B=0, asynchronous nonblocking output\n");
+         }
++        // A scenario/device change can reset the RC method and peak as well.
++        if ((ret = mf_repc_apply_rate_control(avctx)) < 0) {
++            if (sample) IMFSample_Release(sample);
++            return ret;
++        }
+         HRESULT hr = IMFTransform_ProcessMessage(c->mft, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+         if (FAILED(hr)) {
+             av_log(avctx, AV_LOG_ERROR, "could not start streaming (%s)\n", ff_hr_str(hr));
+@@ -939,7 +991,7 @@
+         }
+     }
+ 
+-    return 0;
++    return mf_repc_apply_rate_control(avctx);
+ }
+ 
+ static int64_t mf_encv_input_score(AVCodecContext *avctx, IMFMediaType *type)
+@@ -1515,6 +1567,8 @@
+ 
+ #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+ static const AVOption venc_opts[] = {
++    {"repc_vbr_peak_version", "RePC checked MF peak-constrained VBR ABI", OFFSET(repc_vbr_peak_version), AV_OPT_TYPE_INT, {.i64 = 1}, 1, 1, VE | AV_OPT_FLAG_READONLY},
++    {"repc_require_cbr", "Require retained CBR instead of silently changing rate control", OFFSET(repc_require_cbr), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VE},
+     {"repc_low_delay_version", "RePC nonblocking MF low-delay patch ABI", OFFSET(repc_low_delay_version), AV_OPT_TYPE_INT, {.i64 = 2}, 2, 2, VE},
+     {"rate_control",  "Select rate control mode", OFFSET(opt_enc_rc), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, VE, .unit = "rate_control"},
+     { "default",      "Default mode", 0, AV_OPT_TYPE_CONST, {.i64 = -1}, 0, 0, VE, .unit = "rate_control"},
+diff --git a/configure b/configure
+--- a/configure
++++ b/configure
+@@ -7428,7 +7428,7 @@
+ #endif
+ EOF
+ 
+-mediafoundation_extralibs="-lmfuuid -lole32 -lstrmiids"
++mediafoundation_extralibs="-lmfuuid -lole32 -loleaut32 -lstrmiids"
+ 
+ if enabled uwp; then
+     # In UWP mode, we can't use LoadLibrary+GetProcAddress to conditionally

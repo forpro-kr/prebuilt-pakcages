@@ -58,9 +58,14 @@ $scriptMsys = Convert-ToMsysPath $bashPath (
     Join-Path $PSScriptRoot "build-windows-codecs.sh"
 )
 $lockMsys = Convert-ToMsysPath $bashPath (Join-Path $packageRoot "build-lock.json")
+$packageLock = Get-Content -LiteralPath (Join-Path $packageRoot "build-lock.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+if ([string]$packageLock.version -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}$') {
+    throw 'build-lock.json version must be X.Y.Z'
+}
 
 $plan = [ordered]@{
     architecture = $Architecture
+    version = [string]$packageLock.version
     msystem = $msystem
     msys2Root = [System.IO.Path]::GetFullPath($Msys2Root)
     sourceRoot = $resolvedSourceRoot

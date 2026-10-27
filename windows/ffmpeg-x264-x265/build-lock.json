@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "package": "repc-windows-ffmpeg-x264-x265",
+  "version": "0.1.2",
   "components": {
     "ffmpeg": {
       "repository": "https://git.ffmpeg.org/ffmpeg.git",

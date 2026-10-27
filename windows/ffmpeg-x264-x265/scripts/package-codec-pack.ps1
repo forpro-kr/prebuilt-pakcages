@@ -2,8 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet("x64", "arm64")]
     [string]$Architecture,
-    [Parameter(Mandatory = $true)]
-    [string]$Version,
+    [string]$Version = "",
     [Parameter(Mandatory = $true)]
     [string]$RuntimeDir,
     [Parameter(Mandatory = $true)]
@@ -84,7 +83,13 @@ $packageRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $packageRoot "..\..")).Path
 $lockPath = Join-Path $packageRoot "build-lock.json"
 $lock = Get-Content -LiteralPath $lockPath -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($Version -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}$') { throw 'Version must be X.Y.Z' }
+$lockedVersion = [string]$lock.version
+if ($lockedVersion -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}$') { throw 'build-lock.json version must be X.Y.Z' }
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = $lockedVersion
+} elseif ($Version -ne $lockedVersion) {
+    throw "Version override '$Version' does not match committed build-lock.json version '$lockedVersion'"
+}
 $resolvedRuntimeDir = Resolve-FullPath $repoRoot $RuntimeDir
 $resolvedBuildManifest = Resolve-FullPath $repoRoot $BuildManifestPath
 $resolvedSourceRoot = if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
@@ -121,6 +126,10 @@ if (-not (Test-Path -LiteralPath $resolvedBuildManifest)) {
 }
 $codecBuild = Get-Content -LiteralPath $resolvedBuildManifest -Raw -Encoding UTF8 |
     ConvertFrom-Json
+$packageVersionProperty = $codecBuild.PSObject.Properties['packageVersion']
+if ($null -eq $packageVersionProperty -or [string]$packageVersionProperty.Value -ne $lockedVersion) {
+    throw "Build manifest packageVersion must match committed build-lock.json version '$lockedVersion'; refresh the build manifest"
+}
 if ([string]$codecBuild.architecture -ne $Architecture) {
     throw "Build architecture '$($codecBuild.architecture)' does not match '$Architecture'"
 }
@@ -146,7 +155,13 @@ if ($Architecture -eq 'x64') {
     if ($null -eq $continuousHashProperty -or [string]$continuousHashProperty.Value -ne $expectedContinuousHash) {
         throw 'Codec runtime must be rebuilt with the current continuous bitrate patch before packaging'
     }
-    foreach ($encoder in @('h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'hevc_qsv', 'h264_amf', 'hevc_amf')) {
+    $qsvPatch = Join-Path $packageRoot 'patches\0004-qsv-continuous-bitrate.patch'
+    $expectedQsvHash = (Get-FileHash -LiteralPath $qsvPatch -Algorithm SHA256).Hash.ToLowerInvariant()
+    $qsvHashProperty = $codecBuild.PSObject.Properties['qsvContinuousBitratePatchSha256']
+    if ($null -eq $qsvHashProperty -or [string]$qsvHashProperty.Value -ne $expectedQsvHash) {
+        throw 'Codec runtime must be rebuilt with the current QSV continuous bitrate patch before packaging'
+    }
+    foreach ($encoder in @('h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'hevc_qsv', 'av1_qsv', 'h264_amf', 'hevc_amf')) {
         if ($encoder -notin $encoders) { throw "Missing hardware encoder: $encoder" }
     }
 }

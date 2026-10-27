@@ -1,5 +1,6 @@
 {
   "schema": 1,
+  "packageVersion": "0.1.2",
   "architecture": "arm64",
   "continuousBitratePatchSha256": "",
   "ffmpegRevision": "dd00a614e16a15db0b230dfe45790e913e593695",

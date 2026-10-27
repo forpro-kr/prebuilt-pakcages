@@ -1,5 +1,44 @@
 # Windows FFmpeg patch series
 
+## 2026-10-27 QSV CBR/VBR and continuous rate contract
+
+After `0003`, x64 applies `0004-qsv-continuous-bitrate.patch` to the same locked
+FFmpeg revision. H.264/HEVC/AV1 QSV expose explicit `repc_rate_control` (0 upstream,
+1 CBR, 2 VBR), runtime `repc_continuous_bitrate`, and read-only
+`repc_applied_bitrate`, `repc_applied_peak_bitrate`, `repc_applied_rc`,
+`repc_bitrate_quantum` and `repc_bitrate_error`.
+
+- Applied rates are MFX `GetVideoParam` readback in bits/second, not context
+  fields or an output packet estimate. The quantum reports the driver's BRC
+  multiplier. Unsupported explicit modes fail startup rather than silently
+  normalizing to another mode.
+- Runtime changes support existing CBR/VBR sessions only. Query verifies reset
+  option support and `StartNewSequence=OFF` for the unchanged profile, geometry,
+  frame rate, format and extension data. An independently owned copy is used
+  for each query/reset/readback/rollback, including HDR buffers.
+- Delayed packets and their PTS/bitstream/sync ownership remain in the FIFO.
+  Drain/sync loops use a requested-frame-time deadline (60 and 120 FPS separately).
+  Pending SDK references are retained on timeout until encoder close.
+- Successful reset/readback reports accepted target/peak and leaves the coded
+  sequence intact. A rejected query or verified rollback reports error 1 before
+  submitting the new input, preserving the session and recovery-IDR intent.
+  Unconfirmed rollback or pending GPU timeout reports applied rate -1/error -1;
+  the caller must close the encoder. No context recreation is hidden in this path.
+- The continuity contract applies to bitrate changes, not unrelated dynamic
+  changes of geometry, GOP or QP. Missing options identify an older pack; the
+  application must keep that session unchanged rather than pretending success.
+- `qsvContinuousBitratePatchSha256` separately fingerprints this patch for x64
+  cache reuse and packaging. The corresponding-source archive includes this
+  patch. QSV AV1 is now explicitly enabled in the x64 build configuration.
+
+Run `tests/test-qsv-continuous-bitrate.py --build-dir build/windows-codecs/x64
+--compiler C:/msys64/ucrt64/bin/gcc.exe --runtime-dir
+build/windows-codecs/x64/runtime` after building. It executes the actual patched
+functions with injected MFX dispatch, covers CBR/VBR at 60/120, output ownership,
+Query mutation, readback/rollback/timeout and independent sessions, and loads the
+built DLLs to check public options without opening Intel hardware. Actual Intel
+throughput, output convergence and reconnect acceptance are separate checks.
+
 ## x64 continuous bitrate contract
 
 `0003-continuous-bitrate.patch` applies only to x64 on the same pinned FFmpeg
@@ -54,6 +93,9 @@ Apply only to the ARM64 exported FFmpeg source, in this order:
 
 1. `0001-mf-low-delay.patch`: explicit encoder `VT_BOOL` low-latency/B=0, counted async events, nonblocking output polling and input surface attributes. Exposes contract version 1.
 2. `0002-mf-upstream-fixes.patch`: input type geometry/FPS for strict hardware MFTs, DXGI device-manager reference release, scenario reapplication before low-latency/B=0. Raises the required contract to version 2.
+3. `0005-mf-vbr-peak.patch`: verifies explicit VBR mode/target/peak SetValue and
+   GetValue after Media Foundation negotiation, exposing `repc_vbr_peak_version=1`.
+   The existing low-delay version 2 remains unchanged. It is ARM64-only.
 
 Base: FFmpeg `dd00a614e16a15db0b230dfe45790e913e593695` (`n8.0-19-gdd00a614e1`). Keep the original checkout clean and the existing avcodec 62 / avutil 60 ABI. x64 does not apply this series.
 

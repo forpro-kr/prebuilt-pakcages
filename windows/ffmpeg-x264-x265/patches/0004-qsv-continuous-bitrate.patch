@@ -1,0 +1,448 @@
+--- a/libavcodec/qsvenc.c
++++ b/libavcodec/qsvenc.c
+@@ -97,6 +97,9 @@
+     mfxBitstream   *bs;
+ } QSVPacket;
+ 
++static int repc_qsv_init_bitrate(AVCodecContext *avctx, QSVEncContext *q);
++static int64_t repc_qsv_timeout_us(const AVCodecContext *avctx);
++
+ static const char *print_profile(enum AVCodecID codec_id, mfxU16 profile)
+ {
+     const struct profile_names *profiles;
+@@ -591,7 +594,12 @@
+         return AVERROR(EINVAL);
+     }
+ 
+-    if (want_qscale) {
++    if (q->repc_rate_control) {
++        if (!avctx->bit_rate || want_la || want_qscale || want_vcm || avctx->global_quality > 0)
++            return AVERROR(EINVAL);
++        rc_mode = q->repc_rate_control;
++        rc_desc = rc_mode == MFX_RATECONTROL_VBR ? "explicit VBR" : "explicit CBR";
++    } else if (want_qscale) {
+         rc_mode = MFX_RATECONTROL_CQP;
+         rc_desc = "constant quantization parameter (CQP)";
+     }
+@@ -1823,6 +1831,10 @@
+         ff_qsv_print_warning(avctx, ret,
+                              "Warning in encoder initialization");
+ 
++    /* Retrieval temporarily uses stack-owned extension lists. Restore the
++     * encoder-owned Init list before later runtime/readback transactions. */
++    mfxExtBuffer **repc_saved_ext = q->param.ExtParam;
++    mfxU16 repc_saved_ext_count = q->param.NumExtParam;
+     switch (avctx->codec_id) {
+     case AV_CODEC_ID_MJPEG:
+         ret = qsv_retrieve_enc_jpeg_params(avctx, q);
+@@ -1837,6 +1849,8 @@
+         ret = qsv_retrieve_enc_params(avctx, q);
+         break;
+     }
++    q->param.ExtParam = repc_saved_ext;
++    q->param.NumExtParam = repc_saved_ext_count;
+     if (ret < 0) {
+         av_log(avctx, AV_LOG_ERROR, "Error retrieving encoding parameters.\n");
+         return ret;
+@@ -1844,7 +1858,7 @@
+ 
+     q->avctx = avctx;
+ 
+-    return 0;
++    return repc_qsv_init_bitrate(avctx, q);
+ }
+ 
+ static void free_encoder_ctrl(mfxEncodeCtrl* enc_ctrl)
+@@ -2468,6 +2482,7 @@
+     QSVFrame *qsv_frame = NULL;
+     mfxEncodeCtrl* enc_ctrl = NULL;
+     int ret;
++    const int64_t repc_deadline = av_gettime_relative() + repc_qsv_timeout_us(avctx);
+ 
+     if (frame) {
+         ret = submit_frame(q, frame, &qsv_frame);
+@@ -2538,6 +2553,14 @@
+ 
+     do {
+         ret = MFXVideoENCODE_EncodeFrameAsync(q->session, enc_ctrl, surf, pkt.bs, pkt.sync);
++        if (q->repc_continuous_bitrate &&
++            (ret == MFX_WRN_DEVICE_BUSY || ret == MFX_WRN_IN_EXECUTION) &&
++            av_gettime_relative() >= repc_deadline) {
++            q->repc_applied_bitrate = q->repc_applied_peak_bitrate = -1;
++            q->repc_bitrate_error = -1;
++            ret = MFX_ERR_ABORTED;
++            break;
++        }
+         if (ret == MFX_WRN_DEVICE_BUSY)
+             av_usleep(500);
+     } while (ret == MFX_WRN_DEVICE_BUSY || ret == MFX_WRN_IN_EXECUTION);
+@@ -2577,6 +2600,296 @@
+     goto free;
+ }
+ 
++/* RePC QSV continuous bitrate contract: keep outputs and the coded sequence. */
++typedef struct RepcQsvParams {
++    mfxVideoParam video;
++    mfxExtBuffer **extensions;
++} RepcQsvParams;
++
++static void repc_qsv_free_params(RepcQsvParams *copy)
++{
++    if (copy->extensions) {
++        for (int i = 0; i < copy->video.NumExtParam; ++i)
++            av_freep(&copy->extensions[i]);
++        av_freep(&copy->extensions);
++    }
++}
++
++static int repc_qsv_copy_params(RepcQsvParams *copy, const mfxVideoParam *source,
++                                int continue_sequence)
++{
++    *copy = (RepcQsvParams){0};
++    copy->video = *source;
++    copy->video.ExtParam = NULL;
++    copy->video.NumExtParam = 0;
++    copy->extensions = av_calloc((size_t)source->NumExtParam + 1, sizeof(*copy->extensions));
++    if (!copy->extensions)
++        return AVERROR(ENOMEM);
++    for (int i = 0; i < source->NumExtParam; ++i) {
++        const mfxExtBuffer *ext = source->ExtParam[i];
++        if (!ext || ext->BufferSz < sizeof(*ext) || ext->BufferSz > 65536)
++            goto fail;
++        if (ext->BufferId == MFX_EXTBUFF_ENCODER_RESET_OPTION)
++            continue;
++        copy->extensions[copy->video.NumExtParam] = av_memdup(ext, ext->BufferSz);
++        if (!copy->extensions[copy->video.NumExtParam])
++            goto fail;
++        ++copy->video.NumExtParam;
++    }
++    if (continue_sequence) {
++        mfxExtEncoderResetOption *reset = av_mallocz(sizeof(*reset));
++        if (!reset)
++            goto fail;
++        reset->Header.BufferId = MFX_EXTBUFF_ENCODER_RESET_OPTION;
++        reset->Header.BufferSz = sizeof(*reset);
++        reset->StartNewSequence = MFX_CODINGOPTION_OFF;
++        copy->extensions[copy->video.NumExtParam++] = (mfxExtBuffer *)reset;
++    }
++    copy->video.ExtParam = copy->extensions;
++    return 0;
++fail:
++    repc_qsv_free_params(copy);
++    return AVERROR(ENOMEM);
++}
++
++static int repc_qsv_continues(const mfxVideoParam *param)
++{
++    for (int i = 0; i < param->NumExtParam; ++i) {
++        const mfxExtBuffer *ext = param->ExtParam[i];
++        if (ext->BufferId == MFX_EXTBUFF_ENCODER_RESET_OPTION &&
++            ext->BufferSz >= sizeof(mfxExtEncoderResetOption))
++            return ((const mfxExtEncoderResetOption *)ext)->StartNewSequence == MFX_CODINGOPTION_OFF;
++    }
++    return 0;
++}
++
++static int64_t repc_qsv_target(const mfxVideoParam *param)
++{
++    return (int64_t)param->mfx.TargetKbps * FFMAX(1, param->mfx.BRCParamMultiplier) * 1000;
++}
++
++static int64_t repc_qsv_peak(const mfxVideoParam *param)
++{
++    return (int64_t)param->mfx.MaxKbps * FFMAX(1, param->mfx.BRCParamMultiplier) * 1000;
++}
++
++static int repc_qsv_same_contract(const mfxVideoParam *wanted, const mfxVideoParam *actual)
++{
++    const mfxInfoMFX *a = &wanted->mfx, *b = &actual->mfx;
++    if (a->CodecId != b->CodecId || a->CodecProfile != b->CodecProfile ||
++        a->GopRefDist != b->GopRefDist || a->GopPicSize != b->GopPicSize ||
++        wanted->AsyncDepth != actual->AsyncDepth || wanted->IOPattern != actual->IOPattern ||
++        a->RateControlMethod != b->RateControlMethod ||
++        repc_qsv_target(wanted) != repc_qsv_target(actual) || repc_qsv_peak(wanted) != repc_qsv_peak(actual) ||
++        (uint64_t)a->BufferSizeInKB * FFMAX(1, a->BRCParamMultiplier) !=
++            (uint64_t)b->BufferSizeInKB * FFMAX(1, b->BRCParamMultiplier) ||
++        (uint64_t)a->InitialDelayInKB * FFMAX(1, a->BRCParamMultiplier) !=
++            (uint64_t)b->InitialDelayInKB * FFMAX(1, b->BRCParamMultiplier) ||
++        memcmp(&a->FrameInfo, &b->FrameInfo, sizeof(a->FrameInfo)))
++        return 0;
++    for (int i = 0; i < wanted->NumExtParam; ++i) {
++        const mfxExtBuffer *ext = wanted->ExtParam[i];
++        int matched = 0;
++        if (ext->BufferId == MFX_EXTBUFF_ENCODER_RESET_OPTION)
++            continue;
++        for (int j = 0; j < actual->NumExtParam; ++j) {
++            const mfxExtBuffer *got = actual->ExtParam[j];
++            if (got->BufferId == ext->BufferId && got->BufferSz == ext->BufferSz &&
++                !memcmp(ext, got, ext->BufferSz)) {
++                matched = 1;
++                break;
++            }
++        }
++        if (!matched)
++            return 0;
++    }
++    return 1;
++}
++
++static void repc_qsv_record_applied(QSVEncContext *q, const mfxVideoParam *actual)
++{
++    q->repc_applied_bitrate = repc_qsv_target(actual);
++    q->repc_applied_peak_bitrate = repc_qsv_peak(actual);
++    q->repc_bitrate_quantum = FFMAX(1, actual->mfx.BRCParamMultiplier) * 1000;
++    q->repc_applied_rc = actual->mfx.RateControlMethod;
++}
++
++static int repc_qsv_init_bitrate(AVCodecContext *avctx, QSVEncContext *q)
++{
++    RepcQsvParams actual = {0};
++    int ret = repc_qsv_copy_params(&actual, &q->param, 0);
++    if (ret < 0)
++        return ret;
++    ret = MFXVideoENCODE_GetVideoParam(q->session, &actual.video);
++    if (ret >= MFX_ERR_NONE && ret != MFX_WRN_PARTIAL_ACCELERATION) {
++        repc_qsv_record_applied(q, &actual.video);
++        if (q->repc_rate_control && q->repc_rate_control != actual.video.mfx.RateControlMethod)
++            ret = MFX_ERR_INCOMPATIBLE_VIDEO_PARAM;
++    }
++    repc_qsv_free_params(&actual);
++    if (ret < MFX_ERR_NONE || ret == MFX_WRN_PARTIAL_ACCELERATION) {
++        q->repc_applied_bitrate = q->repc_applied_peak_bitrate = 0;
++        if (q->repc_rate_control)
++            return ff_qsv_print_error(avctx, ret < 0 ? ret : MFX_ERR_UNSUPPORTED,
++                                      "QSV requested rate-control mode was not confirmed");
++    }
++    return 0;
++}
++
++static int64_t repc_qsv_timeout_us(const AVCodecContext *avctx)
++{
++    int64_t us = avctx->framerate.num > 0 && avctx->framerate.den > 0
++        ? av_rescale_rnd(1000000, avctx->framerate.den, avctx->framerate.num, AV_ROUND_UP) : 16667;
++    return av_clip64(us, 4000, 100000);
++}
++
++static int repc_qsv_sync_pending(AVCodecContext *avctx, QSVEncContext *q, int64_t deadline)
++{
++    int ret;
++    for (size_t i = 0; i < av_fifo_can_read(q->async_fifo); ++i) {
++        QSVPacket packet;
++        if (av_fifo_peek(q->async_fifo, &packet, 1, i) < 0)
++            return AVERROR_BUG;
++        while (*packet.sync) {
++            ret = MFXVideoCORE_SyncOperation(q->session, *packet.sync, 1);
++            if (ret == MFX_ERR_NONE) {
++                *packet.sync = NULL;
++                break;
++            }
++            if ((ret != MFX_WRN_IN_EXECUTION && ret != MFX_WRN_DEVICE_BUSY) ||
++                av_gettime_relative() >= deadline)
++                return AVERROR(ETIMEDOUT);
++        }
++    }
++    return 0;
++}
++
++static int repc_qsv_drain_pending(AVCodecContext *avctx, QSVEncContext *q)
++{
++    const int64_t deadline = av_gettime_relative() + repc_qsv_timeout_us(avctx);
++    int ret;
++    /* encode_frame retains every delayed packet in async_fifo, including PTS,
++     * bitstream and sync ownership. Never drop a queued output to reset rates. */
++    do {
++        if (av_gettime_relative() >= deadline || av_fifo_can_read(q->async_fifo) >= 64)
++            return AVERROR(ETIMEDOUT);
++        ret = encode_frame(avctx, q, NULL);
++    } while (ret >= 0);
++    if (ret != AVERROR(EAGAIN))
++        return ret;
++    return repc_qsv_sync_pending(avctx, q, deadline);
++}
++
++static int repc_qsv_update_bitrate(AVCodecContext *avctx, QSVEncContext *q)
++{
++    RepcQsvParams previous = {0}, wanted = {0}, support = {0};
++    RepcQsvParams input = {0}, queried = {0}, actual = {0}, rollback = {0}, restored = {0};
++    mfxVideoParam empty = {0};
++    mfxExtBuffer **original_ext;
++    mfxU16 original_count;
++    mfxStatus status, readback;
++    uint64_t target, peak, multiplier, old_multiplier;
++    int ret = AVERROR_EXTERNAL, did_reset = 0;
++    q->repc_bitrate_error = 0;
++    if (q->repc_applied_bitrate < 0) {
++        q->repc_bitrate_error = -1;
++        return AVERROR_EXTERNAL;
++    }
++    if (avctx->bit_rate == q->old_bit_rate && avctx->rc_max_rate == q->old_rc_max_rate)
++        return 0;
++    if (avctx->bit_rate < 1000 || avctx->bit_rate > 1000000000LL ||
++        avctx->rc_max_rate < avctx->bit_rate || avctx->rc_max_rate > 1200000000LL ||
++        avctx->rc_buffer_size != q->old_rc_buffer_size ||
++        avctx->rc_initial_buffer_occupancy != q->old_rc_initial_buffer_occupancy)
++        goto done;
++    if (repc_qsv_copy_params(&previous, &q->param, 0) < 0)
++        goto done;
++    status = MFXVideoENCODE_GetVideoParam(q->session, &previous.video);
++    if (status < MFX_ERR_NONE || status == MFX_WRN_PARTIAL_ACCELERATION)
++        goto done;
++    if (previous.video.mfx.RateControlMethod != MFX_RATECONTROL_CBR &&
++        previous.video.mfx.RateControlMethod != MFX_RATECONTROL_VBR)
++        goto done;
++    if (repc_qsv_copy_params(&wanted, &previous.video, 0) < 0)
++        goto done;
++    target = (avctx->bit_rate + 999) / 1000;
++    peak = previous.video.mfx.RateControlMethod == MFX_RATECONTROL_CBR
++        ? target : (avctx->rc_max_rate + 999) / 1000;
++    multiplier = (peak + 65534) / 65535;
++    old_multiplier = FFMAX(1, previous.video.mfx.BRCParamMultiplier);
++    wanted.video.mfx.BRCParamMultiplier = multiplier;
++    wanted.video.mfx.TargetKbps = (target + multiplier - 1) / multiplier;
++    wanted.video.mfx.MaxKbps = (peak + multiplier - 1) / multiplier;
++    wanted.video.mfx.BufferSizeInKB = FFMIN(65535,
++        ((uint64_t)previous.video.mfx.BufferSizeInKB * old_multiplier + multiplier - 1) / multiplier);
++    wanted.video.mfx.InitialDelayInKB = FFMIN(65535,
++        ((uint64_t)previous.video.mfx.InitialDelayInKB * old_multiplier + multiplier - 1) / multiplier);
++    empty.mfx.CodecId = previous.video.mfx.CodecId;
++    if (repc_qsv_copy_params(&support, &empty, 1) < 0)
++        goto done;
++    if (MFXVideoENCODE_Query(q->session, NULL, &support.video) != MFX_ERR_NONE)
++        goto done;
++    if (repc_qsv_copy_params(&input, &wanted.video, 1) < 0 ||
++        repc_qsv_copy_params(&queried, &wanted.video, 1) < 0 ||
++        repc_qsv_copy_params(&actual, &wanted.video, 0) < 0 ||
++        repc_qsv_copy_params(&rollback, &previous.video, 1) < 0 ||
++        repc_qsv_copy_params(&restored, &previous.video, 0) < 0)
++        goto done;
++    if (MFXVideoENCODE_Query(q->session, &input.video, &queried.video) != MFX_ERR_NONE ||
++        !repc_qsv_continues(&queried.video) || !repc_qsv_same_contract(&wanted.video, &queried.video))
++        goto done;
++    /* The SDK may mutate Query's input as well as output. Reset gets a fresh
++     * copy, never a driver-mutated approximation of the requested contract. */
++    repc_qsv_free_params(&input);
++    if (repc_qsv_copy_params(&input, &wanted.video, 1) < 0)
++        goto done;
++    ret = repc_qsv_drain_pending(avctx, q);
++    if (ret < 0) {
++        q->repc_applied_bitrate = q->repc_applied_peak_bitrate = -1;
++        goto done;
++    }
++    did_reset = 1;
++    status = MFXVideoENCODE_Reset(q->session, &input.video);
++    readback = MFXVideoENCODE_GetVideoParam(q->session, &actual.video);
++    if (status >= MFX_ERR_NONE && status != MFX_WRN_PARTIAL_ACCELERATION &&
++        repc_qsv_continues(&input.video) && readback >= MFX_ERR_NONE &&
++        readback != MFX_WRN_PARTIAL_ACCELERATION && repc_qsv_same_contract(&wanted.video, &actual.video)) {
++        original_ext = q->param.ExtParam;
++        original_count = q->param.NumExtParam;
++        q->param = actual.video;
++        q->param.ExtParam = original_ext;
++        q->param.NumExtParam = original_count;
++        repc_qsv_record_applied(q, &actual.video);
++        q->old_bit_rate = avctx->bit_rate;
++        q->old_rc_max_rate = avctx->rc_max_rate;
++        ret = 0;
++        goto done;
++    }
++    ret = AVERROR_EXTERNAL;
++    if (status < MFX_ERR_NONE && readback >= MFX_ERR_NONE &&
++        readback != MFX_WRN_PARTIAL_ACCELERATION && repc_qsv_same_contract(&previous.video, &actual.video))
++        goto done;
++    status = MFXVideoENCODE_Reset(q->session, &rollback.video);
++    readback = MFXVideoENCODE_GetVideoParam(q->session, &restored.video);
++    if (status < MFX_ERR_NONE || status == MFX_WRN_PARTIAL_ACCELERATION ||
++        !repc_qsv_continues(&rollback.video) || readback < MFX_ERR_NONE ||
++        readback == MFX_WRN_PARTIAL_ACCELERATION || !repc_qsv_same_contract(&previous.video, &restored.video))
++        q->repc_applied_bitrate = q->repc_applied_peak_bitrate = -1;
++done:
++    if (ret < 0) {
++        q->repc_bitrate_error = q->repc_applied_bitrate < 0 ? -1 : 1;
++        avctx->bit_rate = q->old_bit_rate;
++        avctx->rc_max_rate = q->old_rc_max_rate;
++        av_log(avctx, AV_LOG_WARNING, "QSV continuous bitrate %s; existing outputs retained\n",
++               q->repc_applied_bitrate < 0 ? "failed; close required" : did_reset ? "reset rejected/restored" : "query rejected");
++    }
++    repc_qsv_free_params(&restored); repc_qsv_free_params(&rollback);
++    repc_qsv_free_params(&actual); repc_qsv_free_params(&queried);
++    repc_qsv_free_params(&input); repc_qsv_free_params(&support);
++    repc_qsv_free_params(&wanted); repc_qsv_free_params(&previous);
++    return ret;
++}
++
+ static int update_parameters(AVCodecContext *avctx, QSVEncContext *q,
+                              const AVFrame *frame)
+ {
+@@ -2585,13 +2898,19 @@
+     if (!frame || avctx->codec_id == AV_CODEC_ID_MJPEG)
+         return 0;
+ 
++    if (q->repc_continuous_bitrate) {
++        ret = repc_qsv_update_bitrate(avctx, q);
++        if (ret < 0)
++            return ret;
++    }
+     needReset = update_qp(avctx, q);
+     needReset |= update_max_frame_size(avctx, q);
+     needReset |= update_gop_size(avctx, q);
+     needReset |= update_rir(avctx, q);
+     needReset |= update_low_delay_brc(avctx, q);
+     needReset |= update_frame_rate(avctx, q);
+-    needReset |= update_bitrate(avctx, q);
++    if (!q->repc_continuous_bitrate)
++        needReset |= update_bitrate(avctx, q);
+     needReset |= update_pic_timing_sei(avctx, q);
+     ret = update_min_max_qp(avctx, q);
+     if (ret < 0)
+@@ -2657,9 +2976,17 @@
+         mfxExtBuffer **enc_buf;
+         enum AVPictureType pict_type;
+ 
++        if (q->repc_continuous_bitrate) {
++            ret = repc_qsv_sync_pending(avctx, q, av_gettime_relative() + repc_qsv_timeout_us(avctx));
++            if (ret < 0) {
++                q->repc_applied_bitrate = q->repc_applied_peak_bitrate = -1;
++                q->repc_bitrate_error = -1;
++                return ret; /* FIFO still owns unsynchronized output memory. */
++            }
++        }
+         av_fifo_read(q->async_fifo, &qpkt, 1);
+ 
+-        do {
++        if (*qpkt.sync) do {
+             ret = MFXVideoCORE_SyncOperation(q->session, *qpkt.sync, 1000);
+         } while (ret == MFX_WRN_IN_EXECUTION);
+ 
+--- a/libavcodec/qsvenc.h
++++ b/libavcodec/qsvenc.h
+@@ -52,6 +52,13 @@
+ #endif
+ 
+ #define QSV_COMMON_OPTS \
++{ "repc_rate_control", "Explicit CBR=1 or VBR=2; zero keeps upstream selection", OFFSET(qsv.repc_rate_control), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, VE }, \
++{ "repc_continuous_bitrate", "Checked sequence-preserving live bitrate changes", OFFSET(qsv.repc_continuous_bitrate), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE | AV_OPT_FLAG_RUNTIME_PARAM }, \
++{ "repc_applied_bitrate", "Last driver-confirmed target; -1 requires close", OFFSET(qsv.repc_applied_bitrate), AV_OPT_TYPE_INT64, { .i64 = 0 }, -1, INT64_MAX, VE | AV_OPT_FLAG_READONLY }, \
++{ "repc_applied_peak_bitrate", "Last driver-confirmed peak; -1 requires close", OFFSET(qsv.repc_applied_peak_bitrate), AV_OPT_TYPE_INT64, { .i64 = 0 }, -1, INT64_MAX, VE | AV_OPT_FLAG_READONLY }, \
++{ "repc_bitrate_quantum", "SDK bitrate multiplier in bits per second", OFFSET(qsv.repc_bitrate_quantum), AV_OPT_TYPE_INT64, { .i64 = 1000 }, 1000, INT64_MAX, VE | AV_OPT_FLAG_READONLY }, \
++{ "repc_applied_rc", "Driver-confirmed MFX rate-control mode", OFFSET(qsv.repc_applied_rc), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VE | AV_OPT_FLAG_READONLY }, \
++{ "repc_bitrate_error", "Last update result: 0 accepted, 1 rejected before input, -1 close required", OFFSET(qsv.repc_bitrate_error), AV_OPT_TYPE_INT, { .i64 = 0 }, -1, 1, VE | AV_OPT_FLAG_READONLY }, \
+ { "async_depth", "Maximum processing parallelism", OFFSET(qsv.async_depth), AV_OPT_TYPE_INT, { .i64 = ASYNC_DEPTH_DEFAULT }, 1, INT_MAX, VE },                          \
+ { "preset", NULL, OFFSET(qsv.preset), AV_OPT_TYPE_INT, { .i64 = MFX_TARGETUSAGE_UNKNOWN }, MFX_TARGETUSAGE_UNKNOWN, MFX_TARGETUSAGE_BEST_SPEED,   VE, .unit = "preset" }, \
+ { "veryfast",    NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MFX_TARGETUSAGE_BEST_SPEED  },   INT_MIN, INT_MAX, VE, .unit = "preset" },                                          \
+@@ -318,6 +325,16 @@
+     // This is used for Hyper Encode
+     int dual_gfx;
+ 
++
++    /* Optional RePC rate-control contract; each encoder owns its state. */
++    int repc_rate_control;
++    int repc_continuous_bitrate;
++    int64_t repc_applied_bitrate;
++    int64_t repc_applied_peak_bitrate;
++    int64_t repc_bitrate_quantum;
++    int repc_applied_rc;
++    int repc_bitrate_error;
++
+     AVDictionary *qsv_params;
+ } QSVEncContext;
+ 

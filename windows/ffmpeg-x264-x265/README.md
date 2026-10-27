@@ -1,5 +1,23 @@
 # RePC Windows FFmpeg x264/x265 codec pack
 
+## Package version
+
+`build-lock.json`의 최상위 `version`이 x64·ARM64 codec pack 버전의 단일 원천이다.
+builder는 이 값을 manifest의 `packageVersion`에 기록하고 package script는 버전을
+생략하면 같은 값을 사용한다. 명시한 `-Version` 또는 build manifest 버전이 lock과
+다르면 packaging을 거부하므로 오래된 CI 인자와 다른 버전의 manifest가 섞이지 않는다.
+버전 변경은 이 lock을 먼저 수정하고 build manifest·설치 파일·대응 소스 ZIP을 다시
+생성한다. CI도 별도 상수 대신 lock의 버전을 읽거나 package의 기본값을 사용한다.
+
+## 2026-10-27 QSV bitrate policy
+
+`0004-qsv-continuous-bitrate.patch` adds explicit CBR/VBR and checked continuous
+rate updates to H.264/HEVC/AV1 QSV. It preserves pending output, queries sequence
+continuation, verifies MFX target/peak/mode and rolls back failed resets. The x64
+build and package manifest require the matching QSV patch hash. See the patch
+contract and focused tests below; Intel hardware acceptance is not implied by
+the injected-SDK tests or a successful Windows DLL build.
+
 ## 2026-10-18 x64 live bitrate updates
 
 `0003-continuous-bitrate.patch` adds opt-in AMF/NVENC H.264/HEVC live updates.
@@ -99,7 +117,6 @@ MSYS `git`, `make`다. NSIS 설치 파일을 만들려면 별도로 `makensis.ex
 ```powershell
 .\scripts\package-codec-pack.ps1 `
   -Architecture arm64 `
-  -Version 0.1.0 `
   -RuntimeDir .\build\windows-codecs\arm64\runtime `
   -BuildManifestPath .\build\windows-codecs\arm64\runtime\repc-ffmpeg-codec-build.json `
   -SourceRoot .\build\sources `
