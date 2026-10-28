@@ -18,6 +18,14 @@ fixture EXE는 실제 코덱을 담은 배포 후보가 아니므로 실행·서
 앱 다운로드 URL·설치 SHA/pin 승인 전환 → 실제 새 설치/제거 및 legacy 호환 검증.
 이번 source 변경만으로 서명·배포·설치가 완료되었다고 표시하지 않는다.
 
+`-Sign`은 NSIS `!uninstfinalize`에서 제거 프로그램을 먼저 회사 서명·RFC3161
+timestamp 및 `/pa /tw`로 검증한 뒤 installer에 포함한다. 같은 검증으로 최종 installer도
+서명한다. 서명·검증 실패는 빌드를 중단한다. 로컬 `*-uninstall-verified.exe`와
+`.signing.json`은 compiler에 들어간 제거 프로그램의 검증용 사본이며 별도 배포 입력이 아니다.
+Jenkins 또는 호출자는 전체 `-Sign` 실행 동안 기존 `Global\RePCJenkinsSigning` mutex를
+보유해야 한다. compiler callback은 이 mutex를 재획득하지 않는다. PIN·개인 키는 인수나
+로그에 넣지 않는다. 공식 구문은 [NSIS compile-time commands](https://nsis.sourceforge.io/Docs/Chapter5.html#uninstfinalize)를 따른다.
+
 ## Package version
 
 `build-lock.json`의 최상위 `version`이 x64·ARM64 codec pack 버전의 단일 원천이다.

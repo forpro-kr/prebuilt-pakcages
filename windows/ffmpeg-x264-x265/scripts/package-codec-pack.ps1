@@ -337,22 +337,41 @@ H.264/HEVC patent licensing may apply separately.
                 Remove-Item -LiteralPath $path -Force
             }
         }
-        & $resolvedNsisCompiler `
-            "-INPUTCHARSET" "UTF8" `
-            "-DREPC_ARCH=$Architecture" `
-            "-DREPC_VERSION=$Version" `
-            "-DREPC_STAGE_DIR=$stageDir" `
-            "-DREPC_OUT_FILE=$setupPath" `
-            (Join-Path $packageRoot "packaging\ffmpeg-codec-pack.nsi")
+        $compilerArguments = @('-INPUTCHARSET', 'UTF8', "-DREPC_ARCH=$Architecture",
+            "-DREPC_VERSION=$Version", "-DREPC_STAGE_DIR=$stageDir", "-DREPC_OUT_FILE=$setupPath")
+        if ($Sign) {
+            if (-not $SignToolPath) { $SignToolPath = (Get-Command signtool.exe -ErrorAction Stop).Source }
+            $SignToolPath = (Resolve-Path -LiteralPath $SignToolPath).Path
+            $signCallback = Join-Path $PSScriptRoot 'sign-codec-file.ps1'
+            $signPowerShell = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
+            $signedUninstaller = Join-Path $resolvedOutputDir "AirDesk-ffmpeg-$Architecture-$Version-uninstall-verified.exe"
+            Assert-SafeChildPath $resolvedOutputDir $signedUninstaller
+            if ($CertificateThumbprint -notmatch '^[0-9a-fA-F]{40}$') { throw 'Invalid company certificate thumbprint' }
+            foreach ($value in @($SignToolPath, $signCallback, $signPowerShell, $TimestampUrl, $signedUninstaller)) {
+                # These values cross NSIS/system() quoting. They are build inputs,
+                # never arbitrary shell expressions or credential-bearing strings.
+                if ($value -match '["''\r\n$%]') { throw 'Unsafe NSIS signing callback argument' }
+            }
+            foreach ($path in @($signedUninstaller, ($signedUninstaller + '.signing.json'))) {
+                Assert-SafeChildPath $resolvedOutputDir $path
+                if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+            }
+            $compilerArguments += @("-DREPC_SIGN_CALLBACK=$signCallback", "-DREPC_SIGN_POWERSHELL=$signPowerShell",
+                "-DREPC_SIGN_TOOL=$SignToolPath", "-DREPC_SIGN_THUMBPRINT=$CertificateThumbprint",
+                "-DREPC_SIGN_TIMESTAMP=$TimestampUrl", "-DREPC_SIGNED_UNINSTALLER=$signedUninstaller")
+        }
+        & $resolvedNsisCompiler @compilerArguments (Join-Path $packageRoot 'packaging\ffmpeg-codec-pack.nsi')
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setupPath)) {
             throw "NSIS codec-pack build failed"
         }
         if ($Sign) {
-            if (-not $SignToolPath) { $SignToolPath = (Get-Command signtool.exe -ErrorAction Stop).Source }
-            & $SignToolPath sign /sha1 $CertificateThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $setupPath
-            if ($LASTEXITCODE -ne 0) { throw 'Codec installer signing failed' }
-            & $SignToolPath verify /pa $setupPath
-            if ($LASTEXITCODE -ne 0) { throw 'Codec installer signature verification failed' }
+            if (-not (Test-Path -LiteralPath $signedUninstaller) -or
+                -not (Test-Path -LiteralPath ($signedUninstaller + '.signing.json'))) {
+                throw 'Compiler did not preserve the verified signed uninstaller'
+            }
+            & $signCallback -Path $setupPath -SignToolPath $SignToolPath `
+                -CertificateThumbprint $CertificateThumbprint -TimestampUrl $TimestampUrl
+            if (-not $?) { throw 'Codec installer signing failed' }
         }
         Copy-Item -LiteralPath $setupPath -Destination $stableSetupPath -Force
     } elseif ($RequireNsis) {

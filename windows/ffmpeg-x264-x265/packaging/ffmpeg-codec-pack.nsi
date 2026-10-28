@@ -22,6 +22,14 @@ Name "AirDesk FFmpeg 코덱 팩 (${REPC_ARCH})"
 OutFile "${REPC_OUT_FILE}"
 InstallDir "${PACK_DIR}"
 BrandingText "AirDesk"
+!ifdef REPC_SIGN_CALLBACK
+  !ifndef REPC_SIGN_POWERSHELL
+    !error "REPC_SIGN_POWERSHELL is required with REPC_SIGN_CALLBACK"
+  !endif
+  ; NSIS substitutes %1 with the generated uninstaller before embedding it.
+  ; A failed sign/verify callback aborts compilation, never a best-effort sign.
+  !uninstfinalize '"${REPC_SIGN_POWERSHELL}" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${REPC_SIGN_CALLBACK}" -Path "%1" -SignToolPath "${REPC_SIGN_TOOL}" -CertificateThumbprint "${REPC_SIGN_THUMBPRINT}" -TimestampUrl "${REPC_SIGN_TIMESTAMP}" -VerifiedCopyPath "${REPC_SIGNED_UNINSTALLER}"' = 0
+!endif
 SetCompressor /SOLID lzma
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_WELCOME

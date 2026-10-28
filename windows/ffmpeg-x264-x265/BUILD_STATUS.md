@@ -1,5 +1,19 @@
 # Build status
 
+## 2026-10-28 x64 fresh runtime and signing preparation
+
+- A new x64 prefix was built from all six locked clean source revisions in 246 seconds.
+  The generated manifest records `packageVersion=0.1.2`, current NVENC/AMF/QSV patch hashes,
+  UCRT64 GCC 15.2.0 and the expected namespaced import contract. The old unversioned cache
+  manifest was not relabeled or used as evidence for this fresh build.
+- Direct new-DLL CPU roundtrips: libx264 and libx265, 60/120 settings, 16 frames encoded
+  and 16 CPU-decoded for each of four cases: PASS. Main-app software/NVENC/AMF-fallback
+  cases and two concurrent software encoder contexts also passed.
+- Signed packaging now signs/verifies the generated uninstaller before embedding it,
+  and independently signs/verifies the outer NSIS. A compiler callback failure rejects
+  the build. The caller serializes both stages with the existing signing-token mutex.
+- Final signed-artifact publication and ARM64 native rebuild remain separate gates.
+
 ## 2026-10-28 AirDesk codec path staging
 
 - New source targets `%ProgramW6432%\AirDesk\codecs\ffmpeg\<arch>\<version>` and
