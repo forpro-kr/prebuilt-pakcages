@@ -1,5 +1,33 @@
 # Build status
 
+## 2026-10-31 NVENC continuous upshift source fix
+
+- Opted-in pure bitrate increases and reductions now leave NVENC reset/IDR flags
+  clear; transactions that also change DAR and legacy opt-out keep their existing
+  behavior. Explicit recovery-IDR input is separate.
+- NVENC H.264/HEVC expose read-only `repc_continuous_bitrate_version=2` so the app
+  can reject unsafe upshifts on an older pack without changing that live session.
+  Successful encoder init explicitly publishes 2. Init entry and close entry
+  clear it to 0, including failed re-init of reused private storage. The read-only
+  AVOption's default metadata is not relied on for initialization.
+- Applied `0003-continuous-bitrate.patch` to exact locked FFmpeg source
+  `dd00a614e16a15db0b230dfe45790e913e593695`: patch check and roundtrip passed.
+- The portable extracted-production NVENC harness failed on the old patch's
+  first upshift and passed after the fix for H.264/HEVC at both 60/120 FPS,
+  including 10–50 Mbps ramps, reductions, rejected updates, VBR peak changes,
+  independent owners, DAR+rate reset and unchanged legacy opt-out.
+- The version lifecycle regression caught the initial default-only field bug
+  before DLL build. Running actual init code with controlled vendor calls plus
+  real libavutil 60 defaults/get/set APIs then passed: 0 before open, 2 after
+  successful init, 0 on six injected init failures, early validation failure and
+  close entry. Read-only writes are rejected. This does not open a GPU encoder.
+- This validation uses a controlled vendor dispatch. New Windows DLL build,
+  public AVOption runtime probe, GPU output/bitrate convergence, packaging,
+  installation and real streaming acceptance remain pending. No binary or live
+  service was replaced by this source change.
+- Local evidence: `build/idr-rate-20261031/before-test.log`, `after-test.log`,
+  `version-before.log`, `version-after.log`.
+
 ## 2026-10-28 x64 fresh runtime and signing preparation
 
 - A new x64 prefix was built from all six locked clean source revisions in 246 seconds.

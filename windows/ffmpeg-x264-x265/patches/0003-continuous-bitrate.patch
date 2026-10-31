@@ -187,15 +187,35 @@
  static const FFCodecDefault defaults[] = {
 --- a/libavcodec/nvenc.c
 +++ b/libavcodec/nvenc.c
-@@ -2294,6 +2294,7 @@
+@@ -2167,6 +2167,8 @@
+     NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &dl_fn->nvenc_funcs;
+     int i, res;
+ 
++    ctx->repc_continuous_bitrate_version = 0;
++
+     /* the encoder has to be flushed before it can be closed */
+     if (ctx->nvencoder) {
+         NV_ENC_PIC_PARAMS params        = { .version        = NV_ENC_PIC_PARAMS_VER,
+@@ -2250,6 +2252,9 @@
+     NvencContext *ctx = avctx->priv_data;
+     int ret;
+ 
++    /* Read-only AVOption defaults are skipped by av_opt_set_defaults2(). */
++    ctx->repc_continuous_bitrate_version = 0;
++
+     if (avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) {
+         AVHWFramesContext *frames_ctx;
+         if (!avctx->hw_frames_ctx) {
+@@ -2294,6 +2299,8 @@
              return ret;
      }
  
 +    ctx->repc_applied_bitrate = ctx->encode_config.rcParams.averageBitRate;
++    ctx->repc_continuous_bitrate_version = 2;
      return 0;
  }
  
-@@ -2933,13 +2934,14 @@
+@@ -2933,13 +2940,14 @@
      return res;
  }
  
@@ -211,7 +231,7 @@
      int needs_reconfig = 0;
      int needs_encode_config = 0;
      int reconfig_bitrate = 0, reconfig_dar = 0;
-@@ -2947,6 +2949,17 @@
+@@ -2947,6 +2955,17 @@
  
      params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
      params.reInitEncodeParams = ctx->init_encode_params;
@@ -229,25 +249,23 @@
  
      compute_dar(avctx, &dw, &dh);
      if (dw != ctx->init_encode_params.darWidth || dh != ctx->init_encode_params.darHeight) {
-@@ -2994,8 +3007,15 @@
+@@ -2994,8 +3013,13 @@
          }
  
          if (reconfig_bitrate) {
 -            params.resetEncoder = 1;
 -            params.forceIDR = 1;
-+            /* A pure reduction does not discard encoder references or inject
-+             * an IDR at precisely the moment network capacity has fallen. */
-+            int continuous_decrease = ctx->repc_continuous_bitrate && !reconfig_dar &&
-+                next_config.rcParams.averageBitRate < ctx->encode_config.rcParams.averageBitRate &&
-+                (next_config.rcParams.maxBitRate ? next_config.rcParams.maxBitRate : next_config.rcParams.averageBitRate) <=
-+                (ctx->encode_config.rcParams.maxBitRate ? ctx->encode_config.rcParams.maxBitRate : ctx->encode_config.rcParams.averageBitRate) &&
-+                next_config.rcParams.vbvBufferSize <= ctx->encode_config.rcParams.vbvBufferSize;
-+            params.resetEncoder = !continuous_decrease;
-+            params.forceIDR = !continuous_decrease;
++            /* Opted-in rate-only updates preserve the coded sequence in both
++             * directions. An ABR upshift is not a loss-recovery or format-change
++             * request. Keep upstream reset/IDR behavior for non-opted-in users
++             * and transactions that also change the display aspect ratio. */
++            int continuous_rate = ctx->repc_continuous_bitrate && !reconfig_dar;
++            params.resetEncoder = !continuous_rate;
++            params.forceIDR = !continuous_rate;
  
              needs_encode_config = 1;
              needs_reconfig = 1;
-@@ -3008,7 +3028,9 @@
+@@ -3008,7 +3032,9 @@
      if (needs_reconfig) {
          ret = p_nvenc->nvEncReconfigureEncoder(ctx->nvencoder, &params);
          if (ret != NV_ENC_SUCCESS) {
@@ -258,7 +276,7 @@
          } else {
              if (reconfig_dar) {
                  ctx->init_encode_params.darHeight = dh;
-@@ -3019,10 +3041,12 @@
+@@ -3019,10 +3045,12 @@
                  ctx->encode_config.rcParams.averageBitRate = params.reInitEncodeParams.encodeConfig->rcParams.averageBitRate;
                  ctx->encode_config.rcParams.maxBitRate = params.reInitEncodeParams.encodeConfig->rcParams.maxBitRate;
                  ctx->encode_config.rcParams.vbvBufferSize = params.reInitEncodeParams.encodeConfig->rcParams.vbvBufferSize;
@@ -271,7 +289,7 @@
  }
  
  #ifdef NVENC_HAVE_HEVC_AND_AV1_MASTERING_METADATA
-@@ -3123,15 +3147,23 @@
+@@ -3123,15 +3151,23 @@
          return AVERROR(EINVAL);
  
      if (frame && frame->buf[0]) {
@@ -300,33 +318,36 @@
  
 --- a/libavcodec/nvenc.h
 +++ b/libavcodec/nvenc.h
-@@ -211,6 +211,8 @@
+@@ -211,6 +211,9 @@
  typedef struct NvencContext
  {
      AVClass *avclass;
 +    int repc_continuous_bitrate;
++    int repc_continuous_bitrate_version;
 +    int64_t repc_applied_bitrate;
  
      NvencDynLoadFunctions nvenc_dload_funcs;
  
 --- a/libavcodec/nvenc_h264.c
 +++ b/libavcodec/nvenc_h264.c
-@@ -26,6 +26,8 @@
+@@ -26,6 +26,9 @@
  #define OFFSET(x) offsetof(NvencContext, x)
  #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
  static const AVOption options[] = {
 +    { "repc_continuous_bitrate", "Apply live bitrate changes without restarting the encoder", OFFSET(repc_continuous_bitrate), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE | AV_OPT_FLAG_RUNTIME_PARAM },
++    { "repc_continuous_bitrate_version", "Continuous rate contract: 2 preserves increases and reductions", OFFSET(repc_continuous_bitrate_version), AV_OPT_TYPE_INT, { .i64 = 2 }, 2, 2, VE | AV_OPT_FLAG_READONLY },
 +    { "repc_applied_bitrate", "Last driver-confirmed bitrate, -1 means rollback failed", OFFSET(repc_applied_bitrate), AV_OPT_TYPE_INT64, { .i64 = 0 }, -1, INT64_MAX, VE | AV_OPT_FLAG_READONLY },
  #ifdef NVENC_HAVE_NEW_PRESETS
      { "preset",       "Set the encoding preset",            OFFSET(preset),       AV_OPT_TYPE_INT,   { .i64 = PRESET_P4 },     PRESET_DEFAULT, PRESET_P7,          VE, .unit = "preset" },
  #else
 --- a/libavcodec/nvenc_hevc.c
 +++ b/libavcodec/nvenc_hevc.c
-@@ -26,6 +26,8 @@
+@@ -26,6 +26,9 @@
  #define OFFSET(x) offsetof(NvencContext, x)
  #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
  static const AVOption options[] = {
 +    { "repc_continuous_bitrate", "Apply live bitrate changes without restarting the encoder", OFFSET(repc_continuous_bitrate), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE | AV_OPT_FLAG_RUNTIME_PARAM },
++    { "repc_continuous_bitrate_version", "Continuous rate contract: 2 preserves increases and reductions", OFFSET(repc_continuous_bitrate_version), AV_OPT_TYPE_INT, { .i64 = 2 }, 2, 2, VE | AV_OPT_FLAG_READONLY },
 +    { "repc_applied_bitrate", "Last driver-confirmed bitrate, -1 means rollback failed", OFFSET(repc_applied_bitrate), AV_OPT_TYPE_INT64, { .i64 = 0 }, -1, INT64_MAX, VE | AV_OPT_FLAG_READONLY },
  #ifdef NVENC_HAVE_NEW_PRESETS
      { "preset",       "Set the encoding preset",            OFFSET(preset),       AV_OPT_TYPE_INT,   { .i64 = PRESET_P4 },     PRESET_DEFAULT, PRESET_P7,          VE, .unit = "preset" },

@@ -41,6 +41,15 @@ throughput, output convergence and reconnect acceptance are separate checks.
 
 ## x64 continuous bitrate contract
 
+2026-10-31 NVENC contract version 2 extends reference-preserving rate updates
+to increases as well as reductions. NVENC H.264/HEVC expose the read-only
+`repc_continuous_bitrate_version=2`. An application must require version 2 for
+an increase; an older pack may still force an IDR despite accepting the original
+boolean option. The value is explicitly published after successful encoder init;
+unopened, failed-init and closing contexts report 0. FFmpeg skips read-only
+AVOptions when applying defaults, so the option's default metadata of 2 is not
+used as field initialization. AMF keeps its existing contract and options.
+
 `0003-continuous-bitrate.patch` applies only to x64 on the same pinned FFmpeg
 base below. It is a local adaptation, not an upstream merge. AMF/NVENC H.264
 and HEVC expose `repc_continuous_bitrate` (boolean, default 0) and read-only
@@ -60,9 +69,10 @@ absence means an older codec pack does not support the contract.
   bitrate to -1; the caller must stop using that encoder. Otherwise old applied
   bitrate remains available for recovery. Driver readback does not guarantee
   immediate encoded-output convergence.
-- NVENC uses a copy of the accepted configuration. A pure rate reduction with
-  no DAR change or peak/VBV increase does not request reset/IDR. Increases and
-  format-related changes retain upstream behavior. The vendor call's failure
+- NVENC uses a copy of the accepted configuration. Opted-in pure rate changes,
+  including target/peak/VBV increases, do not request reset/IDR. A transaction
+  that also changes DAR and applications that have not opted in retain upstream
+  behavior. Explicit per-frame recovery-IDR requests remain independent. The vendor call's failure
   propagates before input upload, preserves the accepted configuration, and
   keeps applied bitrate unchanged. The caller can restore prior AVCodecContext
   rates to continue the same session. Unsupported dynamic rate control fails.
@@ -82,10 +92,28 @@ python windows/ffmpeg-x264-x265/tests/test-continuous-bitrate.py --build-dir bui
 The harness compiles the actual update functions with vendor headers and fake
 dispatch tables. It covers H.264/HEVC AMF decreases/increases, partial failure,
 readback mismatch, rollback failure, legacy opt-out and CQP rejection, plus
-NVENC 60/120 FPS decreases, repeated requests, failure/retry, zero peak sentinel,
+NVENC 60/120 FPS increases/reductions, repeated requests, failure/retry, zero peak sentinel,
 DAR change, unsupported capability and unchanged legacy behavior. Actual AMD
 and NVIDIA throughput, output bitrate and keyframe behavior remain separate
 device acceptance checks.
+
+A portable NVENC-only harness can also run against the exported source and
+the locked NVENC header directory without Windows/AMF adapters:
+
+```sh
+python windows/ffmpeg-x264-x265/tests/test-nvenc-continuous-bitrate-policy.py --source-dir <patched-ffmpeg-source> --nvcodec-include <nv-codec-headers/include> --compiler clang
+```
+
+It executes the actual patched transaction for H.264/HEVC at 60/120 FPS,
+10–50 Mbps ramps, failure/rollback state, independent owners, DAR changes and
+legacy opt-out. Optional `--avutil-include <include> --avutil-library <library>`
+executes real libavutil defaults/get/set calls: the version stays 0 before init,
+publishes 2 after the actual NVENC init body succeeds, rejects writes, and returns
+to 0 after a failed re-init or at close entry. Vendor init calls are controlled;
+this is not a GPU open. The runtime-option probe in `test-continuous-bitrate.py`
+verifies unopened value 0, default metadata 2 and read-only flags, and rejects
+writes after the new DLL has been built. Source tests do
+not validate an existing DLL; rebuild and check the patch hash before packaging.
 
 ## ARM64 Media Foundation patch series
 

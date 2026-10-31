@@ -47,8 +47,10 @@ the injected-SDK tests or a successful Windows DLL build.
 ## 2026-10-18 x64 live bitrate updates
 
 `0003-continuous-bitrate.patch` adds opt-in AMF/NVENC H.264/HEVC live updates.
-AMF updates and verifies existing target/peak properties; NVENC pure decreases
-preserve references without requesting reset/IDR. Vendor failures propagate and
+AMF updates and verifies existing target/peak properties; NVENC version 2 pure
+rate increases and reductions preserve references without requesting reset/IDR.
+The read-only `repc_continuous_bitrate_version=2` distinguishes this contract from
+older packs that only preserve reductions. Vendor failures propagate and
 the read-only applied bitrate reports confirmed state. Apps must detect the
 option before using this contract. Patch hashing invalidates the x64 build
 cache and prevents packaging a stale runtime with new corresponding sources.

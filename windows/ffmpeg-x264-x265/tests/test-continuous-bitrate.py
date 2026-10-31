@@ -36,6 +36,8 @@ def main():
     for codec in ('amfenc_h264.c', 'amfenc_hevc.c', 'nvenc_h264.c', 'nvenc_hevc.c'):
         opts = (source / 'libavcodec' / codec).read_text()
         assert '"repc_continuous_bitrate"' in opts and '"repc_applied_bitrate"' in opts
+        if codec.startswith('nvenc_'):
+            assert '"repc_continuous_bitrate_version"' in opts
     header = r'''
 #include <assert.h>
 #include <stdio.h>
@@ -135,7 +137,14 @@ static void test_nv(int fps) {
     assert(state.repc_applied_bitrate==10000000 && state.encode_config.rcParams.averageBitRate==10000000);
     assert(reconfig_encoder(&av,NULL)==0 && nv_calls==1);
     av.bit_rate=av.rc_max_rate=20000000; av.rc_buffer_size=20000000/fps;
-    assert(reconfig_encoder(&av,NULL)==0 && nv_reset && nv_idr);
+    assert(reconfig_encoder(&av,NULL)==0 && !nv_reset && !nv_idr);
+    assert(state.repc_applied_bitrate==20000000);
+    // Repeated ABR upshifts must not become repeated recovery anchors.
+    for(int rate=21000000;rate<=50000000;rate+=1000000) {
+        av.bit_rate=av.rc_max_rate=rate;av.rc_buffer_size=rate/fps;
+        assert(reconfig_encoder(&av,NULL)==0 && !nv_reset && !nv_idr);
+        assert(state.repc_applied_bitrate==rate);
+    }
 
     reset_nv(&state,&av,fps); av.bit_rate=av.rc_max_rate=10000000; av.rc_buffer_size=10000000/fps; nv_fail=1;
     assert(reconfig_encoder(&av,NULL)<0 && state.repc_applied_bitrate==40000000);
@@ -175,6 +184,12 @@ int main(void) {
         patch=Path(__file__).resolve().parent.parent/'patches/0003-continuous-bitrate.patch'
         assert manifest.get('continuousBitratePatchSha256')==hashlib.sha256(patch.read_bytes()).hexdigest(), 'stale patch manifest'
         with os.add_dll_directory(str(runtime)):
+            class OptionDefault(ctypes.Union):
+                _fields_=[('i64',ctypes.c_int64),('dbl',ctypes.c_double),('str',ctypes.c_char_p)]
+            class Option(ctypes.Structure):
+                _fields_=[('name',ctypes.c_char_p),('help',ctypes.c_char_p),
+                          ('offset',ctypes.c_int),('type',ctypes.c_int),('default',OptionDefault),
+                          ('min',ctypes.c_double),('max',ctypes.c_double),('flags',ctypes.c_int),('unit',ctypes.c_char_p)]
             util=ctypes.CDLL(str(runtime/'repc-codec-avutil-60.dll'))
             codec=ctypes.CDLL(str(runtime/'repc-codec-avcodec-62.dll'))
             codec.avcodec_find_encoder_by_name.argtypes=[ctypes.c_char_p]
@@ -184,6 +199,8 @@ int main(void) {
             codec.avcodec_free_context.argtypes=[ctypes.POINTER(ctypes.c_void_p)]
             util.av_opt_set_int.argtypes=[ctypes.c_void_p,ctypes.c_char_p,ctypes.c_int64,ctypes.c_int]
             util.av_opt_get_int.argtypes=[ctypes.c_void_p,ctypes.c_char_p,ctypes.c_int,ctypes.POINTER(ctypes.c_int64)]
+            util.av_opt_find.argtypes=[ctypes.c_void_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_int,ctypes.c_int]
+            util.av_opt_find.restype=ctypes.POINTER(Option)
             util.av_log_set_level(-8)
             for name in (b'h264_amf',b'hevc_amf',b'h264_nvenc',b'hevc_nvenc'):
                 enc=codec.avcodec_find_encoder_by_name(name)
@@ -196,6 +213,16 @@ int main(void) {
                     assert util.av_opt_get_int(ctx,b'repc_applied_bitrate',1,ctypes.byref(applied))==0, name
                     assert applied.value==0, name
                     assert util.av_opt_set_int(ctx,b'repc_applied_bitrate',999,1)<0, name
+                    if name.endswith(b'_nvenc'):
+                        version=ctypes.c_int64()
+                        assert util.av_opt_get_int(ctx,b'repc_continuous_bitrate_version',1,ctypes.byref(version))==0, name
+                        # READONLY defaults are not written by FFmpeg. The
+                        # successful encoder init explicitly publishes 2.
+                        assert version.value==0, name
+                        option=util.av_opt_find(ctx,b'repc_continuous_bitrate_version',None,0,1)
+                        assert option and option.contents.default.i64==2, name
+                        assert option.contents.flags & (1 << 7), name  # AV_OPT_FLAG_READONLY
+                        assert util.av_opt_set_int(ctx,b'repc_continuous_bitrate_version',1,1)<0, name
                 finally:
                     codec.avcodec_free_context(ctypes.byref(ctx))
         print('continuous_bitrate_runtime_options=ok (no hardware encoder opened)')
